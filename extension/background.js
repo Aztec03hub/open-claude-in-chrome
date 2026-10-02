@@ -9,7 +9,7 @@ import { buildKeyEvents } from "./tools/keys.js";
 import { runJavascript } from "./tools/js-exec.js";
 import { formatExceptionEntry } from "./tools/console.js";
 import { validateFiles, setFilesInPage, dropFileInPage, mimeFromBase64 } from "./tools/upload.js";
-import { createDialogLog, maybeHandleDialog, withDialogNotes } from "./tools/dialogs.js";
+import { createDialogLog, maybeHandleDialog, answerPendingDialog, withDialogNotes } from "./tools/dialogs.js";
 import { createInFlight } from "./tools/inflight.js";
 import { failedRecord, formatNetworkLine, isCrossDomain } from "./tools/network.js";
 import { looksLikeError } from "./tools/batch.js";
@@ -52,8 +52,20 @@ const networkRequests = new Map(); // tabId -> [{url, method, status, type, time
 // created by requestWillBeSent instead of recording each request twice.
 const networkByRequestId = new Map();
 const lastUrlByTab = new Map(); // tabId -> main-frame URL, to spot cross-domain navigation
-const inFlight = createInFlight(); // tabs an agent call is driving right now; only their dialogs are auto-answered
 const dialogLog = createDialogLog(); // auto-handled JS dialogs, reported on the next tool result
+// Tabs an agent call is driving right now; only their dialogs are auto-answered.
+// When a call starts, a dialog the user left open on that tab is answered first,
+// bounded so a dead debugger can never stall the call.
+const inFlight = createInFlight({
+  onBegin: (tabId) =>
+    Promise.race([
+      answerPendingDialog(tabId, {
+        sendCommand: (m, p) => chrome.debugger.sendCommand({ tabId }, m, p),
+        log: dialogLog,
+      }),
+      new Promise((r) => setTimeout(r, 3000)),
+    ]),
+});
 const screenshotStore = new Map(); // imageId -> base64
 const screenshotSaves = new Map(); // reqId -> { resolve, reject } for save_to_disk
 
@@ -514,6 +526,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   // A JS dialog blocks the renderer until answered; answer it now and report it
   // on the next tool result for this tab so the session never wedges.
+  if (method === "Page.javascriptDialogClosed") dialogLog.clearPending(tabId); // the user answered it
   if (method === "Page.javascriptDialogOpening") {
     maybeHandleDialog(tabId, params, {
       inFlight,
@@ -2725,7 +2738,9 @@ async function handleToolRequest(id, tool, args, sessionId) {
   // Not awaited: the injection cannot run while the tab is blocked in a modal
   // dialog, and the call (and the dialog handler behind it) must not wait for it.
   if (args && typeof args.tabId === "number" && !SELF_CHECKED_TOOLS.has(tool)) indicator.touch(args.tabId);
-  if (args && typeof args.tabId === "number") inFlight.begin(args.tabId);
+  // Awaited: a dialog the page opened before this call would block every CDP
+  // command of it, so it is answered first (bounded, never throws).
+  if (args && typeof args.tabId === "number") await inFlight.begin(args.tabId);
 
   const t0 = Date.now();
   const label = tool === "computer" ? `computer.${args && args.action}` : tool;

@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createInFlight } from "../extension/tools/inflight.js";
-import { createDialogLog, handleDialogOpening, maybeHandleDialog, withDialogNotes, shouldAccept, describeDialog } from "../extension/tools/dialogs.js";
+import { createDialogLog, handleDialogOpening, maybeHandleDialog, answerPendingDialog, withDialogNotes, shouldAccept, describeDialog } from "../extension/tools/dialogs.js";
 import { failedRecord, formatNetworkLine, isCrossDomain } from "../extension/tools/network.js";
 import { dropFileInPage, mimeFromBase64 } from "../extension/tools/upload.js";
 import { createIndicator, paintIndicator, INDICATOR_ID } from "../extension/tools/indicator.js";
@@ -140,6 +140,32 @@ console.log("== M1: only dialogs during an agent call (+2 s grace) are auto-answ
   inFlight.forget(5);
   clock += 5000;
   ok(!inFlight.active(5), "forget() on tab close clears it");
+}
+
+console.log("== a dialog left open for the user is answered when an agent call starts on that tab (live hang, 2026-10-02) ==");
+{
+  const dlog = createDialogLog();
+  const cmds = [];
+  const sendCommand = async (m, p) => cmds.push([m, p]);
+  const inFlight = createInFlight({ onBegin: (tab) => answerPendingDialog(tab, { sendCommand, log: dlog }) });
+  // Page opens an alert while nobody drives the tab: left alone, remembered.
+  ok((await maybeHandleDialog(5, { type: "alert", message: "user-owned" }, { inFlight, sendCommand, log: dlog })) === false && cmds.length === 0, "idle tab: dialog left for the user");
+  await inFlight.begin(5);
+  ok(cmds.length === 1 && cmds[0][0] === "Page.handleJavaScriptDialog" && cmds[0][1].accept === true, "next call on that tab answers it first (alert accepted)");
+  ok(/alert "user-owned".*accepted automatically/.test(dlog.drain(5)[0] || ""), "and reports it on that call's result");
+  inFlight.end(5);
+  await inFlight.begin(5); inFlight.end(5);
+  ok(cmds.length === 1, "answered once only");
+
+  // The user answers it themselves before any agent call: nothing left to do.
+  await maybeHandleDialog(6, { type: "confirm", message: "delete?" }, { inFlight: createInFlight(), sendCommand, log: dlog });
+  dlog.clearPending(6); // Page.javascriptDialogClosed
+  await inFlight.begin(6);
+  ok(cmds.length === 1, "a dialog the user already closed is not answered again");
+  inFlight.end(6);
+
+  const disp = extractFunction("handleToolRequest");
+  ok(/await\s+inFlight\.begin\(args\.tabId\)/.test(disp), "handleToolRequest awaits begin, so the dialog is answered before the call's CDP commands");
 }
 
 console.log("== wiring in the shipped dispatcher (H3, M1) ==");

@@ -208,6 +208,15 @@ console.log("== gif_creator state machine ==");
   ok(saved.content[1].type === "text" && fs.readFileSync(file, "latin1") === "GIF89a" && file.startsWith(dir), "MCP side writes the GIF to disk and returns its path");
   const plain = { content: [{ type: "image", mimeType: "image/jpeg", data: "AA" }] };
   ok(saveGifBlocks(plain, dir) === plain, "non-gif results untouched");
+
+  // The gif_creator `filename` is honoured (live test 2026-10-02: it was ignored).
+  const gifBlock = () => ({ content: [{ type: "image", mimeType: "image/gif", data: Buffer.from("GIF89a").toString("base64") }] });
+  const named = saveGifBlocks(gifBlock(), dir, ["demo.gif"]).content[0].text;
+  ok(named === `GIF saved to ${path.join(dir, "demo.gif")}`, "requested filename used");
+  const again = saveGifBlocks(gifBlock(), dir, ["demo.gif"]).content[0].text;
+  ok(again !== named && /demo-.*\.gif$/.test(again) && fs.readFileSync(path.join(dir, "demo.gif"), "latin1") === "GIF89a", "an existing file is never overwritten");
+  const safe = saveGifBlocks(gifBlock(), dir, ["../../etc/evil"]).content[0].text;
+  ok(safe === `GIF saved to ${path.join(dir, "evil.gif")}`, "path components stripped and .gif added");
 }
 
 console.log("== shortcuts ==");

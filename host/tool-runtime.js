@@ -314,7 +314,17 @@ export async function callTool(toolName, args) {
     // Extension-side error results arrive already flagged (handleToolRequest).
     // gif_creator export returns the GIF bytes; keep them as a file here.
     // browser_batch can contain a gif_creator export; saveGifBlocks is a no-op without GIF blocks.
-    if (result && result.content) return toolName === "gif_creator" || toolName === "browser_batch" ? saveGifBlocks(result) : result;
+    if (result && result.content) {
+      if (toolName !== "gif_creator" && toolName !== "browser_batch") return result;
+      // The requested export filenames, in the order the GIFs come back.
+      const names =
+        toolName === "gif_creator"
+          ? [coerced.filename]
+          : (coerced.actions || [])
+              .filter((a) => a && a.name === "gif_creator" && a.input && a.input.action === "export")
+              .map((a) => a.input.filename);
+      return saveGifBlocks(result, undefined, names);
+    }
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
     return { ...textResult(`Error: ${err.message}`), isError: true };

@@ -6,13 +6,17 @@
 
 export const DIALOG_GRACE_MS = 2000;
 
-export function createInFlight({ now = Date.now, graceMs = DIALOG_GRACE_MS } = {}) {
+// onBegin(tabId) runs when a call starts on a tab; it may return a promise,
+// which begin() returns so the caller can wait for it (used to answer a dialog
+// that was already open before the call, see dialogs.js answerPendingDialog).
+export function createInFlight({ now = Date.now, graceMs = DIALOG_GRACE_MS, onBegin = null } = {}) {
   const counts = new Map(); // tabId -> running calls
   const graceUntil = new Map(); // tabId -> ms timestamp
   return {
     begin(tabId) {
-      if (typeof tabId !== "number") return;
+      if (typeof tabId !== "number") return undefined;
       counts.set(tabId, (counts.get(tabId) || 0) + 1);
+      return onBegin ? Promise.resolve(onBegin(tabId)).catch(() => {}) : undefined;
     },
     end(tabId) {
       if (typeof tabId !== "number") return;

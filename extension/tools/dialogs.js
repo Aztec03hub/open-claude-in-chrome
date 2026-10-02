@@ -23,7 +23,22 @@ export function describeDialog(params, accept) {
 
 export function createDialogLog() {
   const byTab = new Map();
+  // Dialogs that opened while no agent call was driving the tab: left for the
+  // user, but remembered, because a later agent call on that tab would block
+  // behind it until it timed out.
+  const pending = new Map(); // tabId -> Page.javascriptDialogOpening params
   return {
+    setPending(tabId, params) {
+      pending.set(tabId, params);
+    },
+    takePending(tabId) {
+      const p = pending.get(tabId);
+      pending.delete(tabId);
+      return p;
+    },
+    clearPending(tabId) {
+      pending.delete(tabId);
+    },
     record(tabId, note) {
       const list = byTab.get(tabId) || [];
       list.push(note);
@@ -38,6 +53,7 @@ export function createDialogLog() {
     },
     forget(tabId) {
       byTab.delete(tabId);
+      pending.delete(tabId);
     },
   };
 }
@@ -60,7 +76,23 @@ export async function handleDialogOpening(tabId, params, { sendCommand, log }) {
  * the user's dialog in the user's tab and is left for them. Returns whether we handled it.
  */
 export async function maybeHandleDialog(tabId, params, { inFlight, sendCommand, log }) {
-  if (!inFlight.active(tabId)) return false;
+  if (!inFlight.active(tabId)) {
+    log.setPending(tabId, params);
+    return false;
+  }
+  await handleDialogOpening(tabId, params, { sendCommand, log });
+  return true;
+}
+
+/**
+ * An agent call is starting on this tab. A dialog the page opened while nobody
+ * was driving it is still up and would block every CDP command of the call, so
+ * the agent is now the one driving: answer it with the usual policy and report it.
+ * (Page.javascriptDialogClosed clears it first when the user answered it.)
+ */
+export async function answerPendingDialog(tabId, { sendCommand, log }) {
+  const params = log.takePending(tabId);
+  if (!params) return false;
   await handleDialogOpening(tabId, params, { sendCommand, log });
   return true;
 }

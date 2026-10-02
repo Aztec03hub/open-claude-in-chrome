@@ -56,8 +56,9 @@ export async function runBatch(args, { handlers, sessionId, assertTabOwned, self
   if (bad) return { content: [{ type: "text", text: `browser_batch: ${bad}` }], isError: true };
 
   const tabIds = [...new Set(args.actions.map((a) => a.input.tabId).filter((t) => typeof t === "number"))];
-  tabIds.forEach((t) => inFlight && inFlight.begin(t));
+  const begun = tabIds.map((t) => inFlight && inFlight.begin(t));
   try {
+    await Promise.all(begun);
     return await runActions(args, { handlers, sessionId, assertTabOwned, selfChecked, finish });
   } finally {
     tabIds.forEach((t) => inFlight && inFlight.end(t));
