@@ -157,6 +157,18 @@
     return true;
   }
 
+  // --- Secret fields ---
+  // Never echo the value of a password / card / one-time-code field into a tool
+  // result (read_page, find, form_input): it would land in the model's context.
+  function isSensitiveInput(el) {
+    if (!el || !el.tagName) return false;
+    const tag = el.tagName.toLowerCase();
+    if (tag !== "input" && tag !== "textarea") return false;
+    if ((el.type || "").toLowerCase() === "password") return true;
+    const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
+    return /(^|\s)(current-password|new-password|one-time-code|cc-[a-z-]+)(\s|$)/.test(ac);
+  }
+
   // --- Accessibility tree generation ---
   function generateAccessibilityTree(options = {}) {
     const filter = options.filter || "all";
@@ -214,7 +226,9 @@
         // Extra info for specific elements
         if (tag === "a" && el.href) line += ` href="${el.href}"`;
         if (tag === "img" && el.src) line += ` src="${el.src.substring(0, 100)}"`;
-        if (["input", "textarea"].includes(tag) && el.value) line += ` value="${el.value.substring(0, 100)}"`;
+        if (["input", "textarea"].includes(tag) && el.value) {
+          line += isSensitiveInput(el) ? ` value="[value redacted]"` : ` value="${el.value.substring(0, 100)}"`;
+        }
         if (tag === "input") line += ` type="${el.type || "text"}"`;
         if (el.getAttribute("aria-expanded")) line += ` expanded=${el.getAttribute("aria-expanded")}`;
         if (el.getAttribute("aria-checked")) line += ` checked=${el.getAttribute("aria-checked")}`;
@@ -420,7 +434,9 @@
     target.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
     target.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
 
-    return { success: true, value: target.value };
+    return isSensitiveInput(target)
+      ? { success: true, value: "[value redacted]", sensitive: true }
+      : { success: true, value: target.value };
   }
 
   // --- What is actually at a point ---
@@ -602,6 +618,21 @@
       return true;
     }
 
+    if (msg.type === "scrollToRef") {
+      const el = resolveRef(msg.ref);
+      if (!el) {
+        sendResponse({ result: { ok: false } });
+        return true;
+      }
+      try {
+        el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      } catch {
+        el.scrollIntoView(true);
+      }
+      sendResponse({ result: { ok: true } });
+      return true;
+    }
+
     if (msg.type === "setFormValue") {
       const result = setFormValue(msg.ref, msg.value);
       sendResponse({ result });
@@ -664,5 +695,6 @@
     getRefCoordinates,
     resolveRef,
     elementMap,
+    isSensitiveInput,
   };
 })();

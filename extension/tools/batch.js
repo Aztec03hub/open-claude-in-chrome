@@ -1,0 +1,90 @@
+// browser_batch: run {name, input} tool calls sequentially in one round trip.
+// Semantics follow the official extension: stop at the first error and say how
+// many completed; outputs (text and images) come back in order; browser_batch
+// cannot nest; tabs_context_mcp / tabs_create_mcp inside a batch need no tabId.
+
+import { assertTabOwned as defaultAssertTabOwned } from "./ownership.js";
+
+const TABLESS = new Set(["tabs_context_mcp", "tabs_create_mcp"]);
+
+// Handlers report most failures as plain text, not by throwing, so a batch has
+// to recognise them or it would plough on after a failed step.
+const ERROR_TEXT =
+  /^(Error\b|Failed\b|Could not\b|Unknown\b|Invalid\b|No element found\b|None of the requested\b|Tab \d+ is not in\b)|\bis required\b|\brequires '/;
+
+export function looksLikeError(result) {
+  if (!result || typeof result !== "object") return false;
+  if (result.isError) return true;
+  const first = Array.isArray(result.content) ? result.content.find((c) => c && c.type === "text") : null;
+  return !!first && ERROR_TEXT.test(String(first.text || "").trim());
+}
+
+export function actionLabel(a) {
+  const act = a && a.input && a.input.action;
+  return typeof act === "string" ? `${a.name}:${act}` : String(a && a.name);
+}
+
+function textOf(result) {
+  const t = Array.isArray(result?.content) ? result.content.find((c) => c.type === "text") : null;
+  return t ? String(t.text) : "Tool failed";
+}
+
+function failure(content, i, total, label, msg, done) {
+  const text = `actions[${i}] (${label}) failed: ${msg} (${done} completed, ${total - i - 1} remaining)`;
+  return { content: [...content, { type: "text", text }], isError: true };
+}
+
+/** Structural validation; returns an error string or null. */
+export function validateBatch(args, handlers) {
+  const actions = args && args.actions;
+  if (!Array.isArray(actions) || actions.length === 0) return "actions must be a non-empty array";
+  for (let i = 0; i < actions.length; i++) {
+    const a = actions[i];
+    if (!a || typeof a.name !== "string") return `actions[${i}].name must be a string`;
+    if (a.name === "browser_batch") return `actions[${i}]: browser_batch cannot be nested`;
+    if (!a.input || typeof a.input !== "object" || Array.isArray(a.input)) return `actions[${i}].input must be an object`;
+    if (!handlers[a.name]) return `actions[${i}]: unknown tool "${a.name}"`;
+  }
+  return null;
+}
+
+/**
+ * @param args      { actions: [{name, input}] }
+ * @param opts      { handlers, sessionId, assertTabOwned }
+ */
+export async function runBatch(args, { handlers, sessionId, assertTabOwned = defaultAssertTabOwned }) {
+  const bad = validateBatch(args, handlers);
+  if (bad) return { content: [{ type: "text", text: `browser_batch: ${bad}` }], isError: true };
+
+  const actions = args.actions;
+  const total = actions.length;
+  const out = [];
+  for (let i = 0; i < total; i++) {
+    const a = actions[i];
+    const label = actionLabel(a);
+    let input = a.input;
+    if (TABLESS.has(a.name) && "tabId" in input) {
+      const { tabId, ...rest } = input;
+      input = rest;
+    }
+    let result;
+    try {
+      if (!TABLESS.has(a.name) && typeof input.tabId === "number") await assertTabOwned(sessionId, input.tabId);
+      result = await handlers[a.name](input);
+    } catch (e) {
+      return failure(out, i, total, label, e && e.message ? e.message : String(e), i);
+    }
+    if (looksLikeError(result)) return failure(out, i, total, label, textOf(result), i);
+
+    const tag = `[${i + 1}/${total} ${label}]`;
+    let tagged = false;
+    for (const block of result?.content || []) {
+      if (!tagged && block.type === "text") {
+        out.push({ ...block, text: `${tag} ${block.text}` });
+        tagged = true;
+      } else out.push(block);
+    }
+    if (!tagged) out.push({ type: "text", text: `${tag} ok` });
+  }
+  return { content: out };
+}
