@@ -3,6 +3,7 @@
 
 import * as humanize from "./humanize/index.js";
 import * as audit from "./audit/index.js";
+import { createSessions, sidOf } from "./sessions.js";
 
 // Prevent unhandled rejections from killing the service worker
 self.addEventListener("unhandledrejection", (event) => {
@@ -13,8 +14,6 @@ const NATIVE_HOST_NAME = "com.anthropic.open_claude_in_chrome";
 
 // --- State ---
 let nativePort = null;
-let tabGroupId = null;
-let tabGroupTabs = new Set();
 
 // --- Per-call timing forensics -------------------------------------------
 // Ring buffer of tool-call timings, persisted to chrome.storage.session so a
@@ -119,6 +118,8 @@ chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
     if (!nativePort) connectNativeHost();
+    // Backstop: sessions idle 30 min with no host connection are ended.
+    sessionTabs.sweepIdle(!!nativePort).catch(() => {});
   }
 });
 
@@ -138,7 +139,10 @@ function connectNativeHost() {
       // Heartbeat acks (and any other non-request server-originated messages)
       // are intentionally ignored here — only tool_request kicks work.
       if (msg.type === "tool_request" && msg.id) {
-        handleToolRequest(msg.id, msg.tool, msg.args || {});
+        handleToolRequest(msg.id, msg.tool, msg.args || {}, msg.session_id);
+      } else if (msg.type === "session_end") {
+        // Client session over: close tabs it created, ungroup tabs it attached.
+        sessionTabs.endSession(sidOf(msg.session_id)).catch(() => {});
       } else if (msg.type === "recording_saved") {
         // Reply from the native host after writing a recording bundle to disk.
         const resolve = recorder.pendingSaves.get(String(msg.recording_id));
@@ -250,37 +254,23 @@ function nativeRequest(msg) {
 }
 
 // --- Tab group management ---
-async function ensureTabGroup(createIfEmpty) {
-  // Check if our tab group still exists
-  if (tabGroupId !== null) {
-    try {
-      const group = await chrome.tabGroups.get(tabGroupId);
-      if (group) {
-        // Verify tabs are still in the group
-        const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-        tabGroupTabs = new Set(tabs.map((t) => t.id));
-        if (tabGroupTabs.size > 0) return;
-      }
-    } catch {
-      tabGroupId = null;
-      tabGroupTabs.clear();
+// Per-session ownership lives in sessions.js (one Chrome tab group per MCP
+// session). assertTabOwned(sessionId, tabId) is THE ownership gate: it resolves
+// to the live tab or throws "Tab X is not in this session's tab group. Valid
+// tab IDs are: ...". handleToolRequest runs it for every tool carrying a
+// tabId; browser_batch must call it per sub-call (sessions.assertTabOwned).
+const sessionTabs = createSessions(chrome, {
+  // Never leave a CDP debugger (and its infobar) on a tab we stop managing.
+  onRelease: async (tabId) => {
+    if (attachedTabs.has(tabId)) {
+      try { await chrome.debugger.detach({ tabId }); } catch {}
+      attachedTabs.delete(tabId);
     }
   }
+});
+const assertTabOwned = (sessionId, tabId) => sessionTabs.assertTabOwned(sidOf(sessionId), tabId);
 
-  if (!createIfEmpty) return;
-
-  // Create a new window with a tab, group it. focused:false — the window is
-  // created and rendered, but does not jump in front of whatever the operator
-  // is doing. set_tab_focus raises it on purpose when that is actually wanted.
-  const win = await chrome.windows.create({ focused: false, url: "about:blank" });
-  const tab = win.tabs[0];
-  const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-  await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
-  tabGroupId = groupId;
-  tabGroupTabs = new Set([tab.id]);
-}
-
-function formatTabContext(tabs) {
+function formatTabContext(tabs, tabGroupId = null) {
   const available = tabs.map((t) => ({
     tabId: t.id,
     title: t.title || "Untitled",
@@ -302,29 +292,9 @@ function formatTabContext(tabs) {
   };
 }
 
-async function isInGroup(tabId) {
-  // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.groupId !== -1) {
-      // Recover tabGroupId if we lost it (service worker restart)
-      if (tabGroupId === null) {
-        try {
-          const group = await chrome.tabGroups.get(tab.groupId);
-          if (group.title === "MCP") {
-            tabGroupId = group.id;
-            const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-            tabGroupTabs = new Set(groupTabs.map((t) => t.id));
-          }
-        } catch {}
-      }
-      return tab.groupId === tabGroupId;
-    }
-    return tabGroupTabs.has(tabId);
-  } catch {
-    return false;
-  }
-}
+// Is this tab under ANY session's control? The per-session check already ran
+// in handleToolRequest; handlers keep calling this as a cheap sanity check.
+const isInGroup = (tabId) => sessionTabs.isManaged(tabId);
 
 // --- CDP helpers ---
 // NOTE ON TAB ACTIVATION: nothing in here selects a tab or raises a window.
@@ -458,7 +428,7 @@ function cdpDetail(method, p) {
 
 // Clean up when tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
-  tabGroupTabs.delete(tabId);
+  sessionTabs.onTabRemoved(tabId).catch(() => {});
   if (attachedTabs.has(tabId)) {
     try { chrome.debugger.detach({ tabId }); } catch {}
     attachedTabs.delete(tabId);
@@ -1222,44 +1192,63 @@ function dbg(kind, detail, extra) {
 
 // --- Tool handlers ---
 const toolHandlers = {
-  async tabs_context_mcp(args) {
-    await ensureTabGroup(args.createIfEmpty);
-    if (tabGroupId === null) {
+  async tabs_context_mcp(args, sid) {
+    const { tabs, groupId } = await sessionTabs.context(sid, args.createIfEmpty);
+    if (!tabs.length) {
       return {
-        content: [{ type: "text", text: "No MCP tab group exists. Use createIfEmpty: true to create one." }],
+        content: [{ type: "text", text: "This session has no tab group. Use createIfEmpty: true to create one, or tabs_attach_mcp to take over an existing tab (see tabs_list_all)." }],
       };
     }
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-    return formatTabContext(tabs);
+    return formatTabContext(tabs, groupId);
   },
 
-  async tabs_create_mcp(args) {
-    await ensureTabGroup(true);
-    // Create the tab INSIDE the MCP group's own window and do NOT select it:
-    // automation must never yank the operator away from what they are looking
-    // at. Without windowId the tab lands in whatever window is currently
-    // focused — i.e. the operator's — which is exactly the interruption we
-    // are avoiding. Use the set_tab_focus tool to surface a tab deliberately.
-    let windowId;
-    try {
-      const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-      windowId = groupTabs[0]?.windowId;
-    } catch {}
-    const tab = await chrome.tabs.create(
-      windowId ? { active: false, windowId } : { active: false }
-    );
-    await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
-    tabGroupTabs.add(tab.id);
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-    const result = formatTabContext(tabs);
+  // New tab in this session's group. Never selected, never raises a window
+  // (#28); created in the group's OWN window so it cannot land in the operator's.
+  async tabs_create_mcp(args, sid) {
+    const { tab } = await sessionTabs.createTab(sid);
+    const { tabs, groupId } = await sessionTabs.context(sid, false);
+    const result = formatTabContext(tabs, groupId);
     result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
     return result;
   },
 
-  async tabs_close_mcp(args) {
-    // Accept either a single tabId (most common) or a tabIds array for
-    // batch close. Validate every id is actually in the current MCP group
-    // so we never close the user's other tabs.
+  // Every open tab in the browser, with the session group (if any) owning it.
+  async tabs_list_all(args, sid) {
+    const tabs = await sessionTabs.listAll(sid);
+    const text = tabs
+      .map((t) => `  \u2022 tabId ${t.tabId} (window ${t.windowId})${t.active ? " [active]" : ""}${t.session ? ` [session: ${t.session}${t.mine ? ", yours" : ""}]` : ""}: "${t.title}" (${t.url})`)
+      .join("\n");
+    return { content: [{ type: "text", text: JSON.stringify({ tabs }) + "\n\nAll open tabs:\n" + text }] };
+  },
+
+  // Take over an EXISTING tab: grouped in place, never reloaded or moved.
+  async tabs_attach_mcp(args, sid) {
+    try {
+      const r = await sessionTabs.attach(sid, args || {});
+      const { tabs, groupId } = await sessionTabs.context(sid, false);
+      const result = formatTabContext(tabs, groupId);
+      result.content[0].text =
+        (r.already ? `Tab ${r.tab.id} is already in this session's group.` : `Attached tab ${r.tab.id} (${r.tab.url || ""}).`) +
+        `\n\n` + result.content[0].text;
+      return result;
+    } catch (e) {
+      return { content: [{ type: "text", text: e.message }] };
+    }
+  },
+
+  // Release a tab back to the user: ungroup, never close.
+  async tabs_detach_mcp(args, sid) {
+    try {
+      const tab = await sessionTabs.detach(sid, args?.tabId);
+      return { content: [{ type: "text", text: `Detached tab ${tab.id}; it is still open as an ordinary tab.` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: e.message }] };
+    }
+  },
+
+  async tabs_close_mcp(args, sid) {
+    // Accept either a single tabId (most common) or a tabIds array for batch
+    // close. Only tabs in THIS session's group are closed.
     const requested = Array.isArray(args?.tabIds)
       ? args.tabIds
       : args?.tabId !== undefined
@@ -1275,64 +1264,35 @@ const toolHandlers = {
         ]
       };
     }
-    const inGroup = [];
-    const skipped = [];
-    for (const id of requested) {
-      const idNum = typeof id === "string" ? Number(id) : id;
-      if (await isInGroup(idNum)) inGroup.push(idNum);
-      else skipped.push(idNum);
-    }
-    if (inGroup.length === 0) {
+    const { closed, skipped } = await sessionTabs.close(sid, requested);
+    const valid = (await sessionTabs.ownedTabs(sid)).map((t) => t.id);
+    if (closed.length === 0) {
       return {
         content: [
           {
             type: "text",
-            text: `None of the requested tabs are in the MCP group. Requested: [${requested.join(", ")}]. Use tabs_context_mcp to see what is in the group.`
+            text: `None of the requested tabs are in this session's tab group. Requested: [${requested.join(", ")}]. Valid tab IDs are: ${valid.length ? valid.join(", ") : "(none)"}.`
           }
         ]
       };
     }
-    // chrome.tabs.remove force-closes — no beforeunload prompt. Detach any
-    // CDP debuggers proactively so the onRemoved handler doesn't race.
-    for (const id of inGroup) {
-      if (attachedTabs.has(id)) {
-        try { await chrome.debugger.detach({ tabId: id }); } catch {}
-        attachedTabs.delete(id);
-      }
-    }
-    await chrome.tabs.remove(inGroup);
-    for (const id of inGroup) tabGroupTabs.delete(id);
-
-    // Closing the last tab in the group also closes the window; the group
-    // becomes invalid. Reflect that in the response so the model doesn't
-    // try to reuse stale tabIds.
-    let tabs = [];
-    try {
-      if (tabGroupId !== null) {
-        tabs = await chrome.tabs.query({ groupId: tabGroupId });
-      }
-    } catch {}
+    const head =
+      `Closed ${closed.length} tab(s): [${closed.join(", ")}]` +
+      (skipped.length ? `. Skipped (not in group): [${skipped.join(", ")}]` : "");
+    // The group lives while it has any tab; once the last one closes it is gone.
+    const { tabs, groupId } = await sessionTabs.context(sid, false);
     if (tabs.length === 0) {
-      tabGroupId = null;
-      tabGroupTabs.clear();
       return {
         content: [
           {
             type: "text",
-            text:
-              `Closed ${inGroup.length} tab(s): [${inGroup.join(", ")}]` +
-              (skipped.length ? `. Skipped (not in group): [${skipped.join(", ")}]` : "") +
-              `. The MCP tab group is now empty — the window has been closed. Use tabs_context_mcp({ createIfEmpty: true }) to start a new group.`
+            text: head + `. This session's tab group is now empty. Use tabs_context_mcp({ createIfEmpty: true }) to start a new one.`
           }
         ]
       };
     }
-    const result = formatTabContext(tabs);
-    result.content[0].text =
-      `Closed ${inGroup.length} tab(s): [${inGroup.join(", ")}]` +
-      (skipped.length ? `. Skipped (not in group): [${skipped.join(", ")}]` : "") +
-      `.\n\n` +
-      result.content[0].text;
+    const result = formatTabContext(tabs, groupId);
+    result.content[0].text = head + `.\n\n` + result.content[0].text;
     return result;
   },
 
@@ -1378,7 +1338,7 @@ const toolHandlers = {
     });
 
     const tab = await chrome.tabs.get(tabId);
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+    const tabs = await chrome.tabs.query({ groupId: tab.groupId });
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
@@ -1917,7 +1877,7 @@ const toolHandlers = {
     const merged = stored.filter((e) => !seen.has(`${e.t}|${e.tool}`)).concat(callTimings);
     const tabs = [];
     const winIds = new Set();
-    for (const id of tabGroupTabs) {
+    for (const id of await sessionTabs.allManagedTabIds()) {
       try {
         const t = await chrome.tabs.get(id);
         winIds.add(t.windowId);
@@ -2571,7 +2531,8 @@ const toolHandlers = {
 };
 
 // --- Tool dispatch ---
-async function handleToolRequest(id, tool, args) {
+const SELF_CHECKED_TOOLS = new Set(["tabs_attach_mcp", "tabs_detach_mcp", "tabs_close_mcp", "tabs_list_all"]);
+async function handleToolRequest(id, tool, args, sessionId) {
   // recording_ack arrives from the MCP server when Claude confirms receipt of
   // a recording_complete event. Mark it delivered so stopRecording() can
   // report the "delivered to Claude Code" state (§4).
@@ -2585,6 +2546,19 @@ async function handleToolRequest(id, tool, args) {
   if (!handler) {
     sendError(id, `Unknown tool: ${tool}`);
     return;
+  }
+
+  // Session = stamped session_id (top level, or inside args); old clients get "default".
+  const sid = sidOf(sessionId ?? (args && args.session_id));
+  sessionTabs.touch(sid);
+  // Ownership gate for every tool that names a tab. Tab-lifecycle tools do their own checks.
+  if (args && args.tabId !== undefined && args.tabId !== null && !SELF_CHECKED_TOOLS.has(tool)) {
+    try {
+      await assertTabOwned(sid, args.tabId);
+    } catch (e) {
+      sendResponse(id, { content: [{ type: "text", text: e.message }] });
+      return;
+    }
   }
 
   const t0 = Date.now();
@@ -2620,7 +2594,7 @@ async function handleToolRequest(id, tool, args) {
   }
   try {
     const t0 = Date.now();
-    const result = await handler(args);
+    const result = await handler(args, sid);
     // Record the SHAPE of the reply, not the reply. Echoing the response text
     // here would make the stream a copy of what the caller already received,
     // which is worth nothing to them; what they cannot see is how long it took
@@ -3290,19 +3264,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 // --- Init ---
 
-// Recover MCP tab group state after service worker restart
-async function recoverTabGroupState() {
-  try {
-    const groups = await chrome.tabGroups.query({ title: "MCP" });
-    if (groups.length > 0) {
-      tabGroupId = groups[0].id;
-      const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-      tabGroupTabs = new Set(tabs.map((t) => t.id));
-    }
-  } catch {
-    // Not critical — will be set on first tabs_context_mcp call
-  }
-}
-
-recoverTabGroupState();
+// Reload the session -> group map from storage.session and reconcile it
+// against live groups after a service worker restart.
+sessionTabs.load().catch(() => {});
 connectNativeHost();

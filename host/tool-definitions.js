@@ -13,7 +13,7 @@ export const TOOLS = [
   {
     name: "tabs_context_mcp",
     description:
-      "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
+      "Get context information about this session's MCP tab group (each session has its own). Returns all tab IDs inside the group if it exists; if the session already attached tabs it just lists them. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
     paramShape: {
       createIfEmpty: z
         .boolean()
@@ -28,6 +28,38 @@ export const TOOLS = [
     description:
       "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
     paramShape: {}
+  },
+  {
+    name: "tabs_list_all",
+    description:
+      "List EVERY open tab in the browser (all windows): tabId, windowId, title, url, active, and which session's tab group (if any) it belongs to. Read-only; does not change anything. Use it to find an existing tab, then tabs_attach_mcp to take it over.",
+    paramShape: {}
+  },
+  {
+    name: "tabs_attach_mcp",
+    description:
+      "Take control of an EXISTING tab (for example one the user already has open) by adding it to this session's tab group. The tab is grouped in place: it stays in its own window, is not reloaded, and no new window or blank tab is created. Identify it by tabId or by `match`. Tabs owned by another session are refused unless steal is true. Use tabs_detach_mcp to hand it back.",
+    paramShape: {
+      tabId: z.number().optional().describe("ID of the tab to attach (see tabs_list_all)."),
+      match: z
+        .string()
+        .optional()
+        .describe(
+          "Case-insensitive substring of the tab's URL or title. If several tabs match, the single active one is used; otherwise an error lists the candidates and you must pass tabId."
+        ),
+      steal: z
+        .boolean()
+        .optional()
+        .describe("Take the tab even if another session's tab group owns it. Default false.")
+    }
+  },
+  {
+    name: "tabs_detach_mcp",
+    description:
+      "Release a tab from this session's tab group. The tab is ungrouped, NEVER closed, and stays open as an ordinary tab. Use this to hand back a tab you attached with tabs_attach_mcp.",
+    paramShape: {
+      tabId: z.number().describe("ID of the tab to release. Must be in this session's tab group.")
+    }
   },
   {
     name: "debug_timings",
