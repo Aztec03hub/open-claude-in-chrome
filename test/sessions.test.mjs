@@ -4,18 +4,22 @@ let fail = 0; const ok = (c, m) => { console.log((c ? "  PASS " : "  FAIL ") + m
 const rejects = async (p) => { try { await p; return null; } catch (e) { return e.message; } };
 
 function fakeChrome(tabs0 = []) {
-  const st = { tabs: tabs0.map((t) => ({ groupId: -1, active: false, ...t })), groups: {}, nextTab: 500, nextGroup: 900, nextWin: 50, store: {}, calls: [] };
+  const st = { tabs: tabs0.map((t) => ({ groupId: -1, active: false, ...t })), groups: {}, nextTab: 500, nextGroup: 900, nextWin: 50, store: {}, calls: [], focusedWindow: 1 };
   const rec = (n, a) => st.calls.push({ n, a });
   const chrome = {
     tabs: {
+      update: async (id, o) => { rec("tabs.update", { id, ...o }); const t = st.tabs.find((x) => x.id === id); Object.assign(t, o); return { ...t }; },
       get: async (id) => { const t = st.tabs.find((x) => x.id === id); if (!t) throw new Error("no tab"); return { ...t }; },
       query: async (q) => st.tabs.filter((t) => (q.groupId === undefined || t.groupId === q.groupId)).map((t) => ({ ...t })),
       create: async (o) => { rec("tabs.create", o); const t = { id: st.nextTab++, windowId: o.windowId ?? 1, active: !!o.active, groupId: -1 }; st.tabs.push(t); return { ...t }; },
+      // Chrome semantics: a NEW group goes in createProperties.windowId, else the
+      // focused ("current") window, and the tab is moved there. Grouping unpins.
       group: async (o) => {
         rec("tabs.group", o);
         const t = st.tabs.find((x) => x.id === o.tabIds[0]);
         const gid = o.groupId ?? st.nextGroup++;
-        if (o.groupId === undefined) st.groups[gid] = { id: gid, windowId: t.windowId };
+        if (o.groupId === undefined) st.groups[gid] = { id: gid, windowId: o.createProperties?.windowId ?? st.focusedWindow };
+        t.windowId = st.groups[gid].windowId; t.pinned = false;
         t.groupId = gid; return gid;
       },
       ungroup: async (id) => { rec("tabs.ungroup", id); const t = st.tabs.find((x) => x.id === id); t.groupId = -1; },
@@ -30,6 +34,7 @@ function fakeChrome(tabs0 = []) {
   };
   return { chrome, st };
 }
+const userGroup = (st, id, windowId) => { st.groups[id] = { id, windowId, title: "Work" }; };
 const mk = (tabs, opts) => { const f = fakeChrome(tabs); return { ...f, S: createSessions(f.chrome, opts) }; };
 
 console.log("== session id ==");
@@ -41,6 +46,7 @@ console.log("== create: own window, not selected, one blank tab (#28) ==");
   const { tab, groupId } = await S.createTab("A");
   ok(st.calls.filter((c) => c.n === "windows.create").length === 1 && st.tabs.length === 1, "first tab reuses the window's tab (no extra blank)");
   ok(st.calls.find((c) => c.n === "windows.create").a.focused === false, "window not focused");
+  ok(tab.windowId !== 1 && st.tabs.find((t) => t.id === tab.id).windowId === tab.windowId && st.groups[groupId].windowId === tab.windowId, "new tab stays in the window just created, not the focused one");
   ok(st.groups[groupId].title === "Claude", "first session titled Claude");
   const t2 = await S.createTab("A");
   const c = st.calls.find((c) => c.n === "tabs.create");
@@ -75,7 +81,8 @@ console.log("== attach: group from the user's own tab, nothing created ==");
   const r = await S.attach("A", { match: "INBOX" });
   ok(r.tab.id === 1 && st.tabs.find((t) => t.id === 1).groupId === r.groupId, "matched case-insensitively and grouped");
   ok(!st.calls.some((c) => ["windows.create", "tabs.create", "tabs.remove"].includes(c.n)), "no window, no tab created, nothing closed");
-  ok(st.tabs.find((t) => t.id === 1).windowId === 7 && st.tabs.length === 3, "tab stays in its window");
+  ok(st.tabs.find((t) => t.id === 1).windowId === 7 && st.tabs.length === 3, "tab stays in its window (focused window is 1, not 7)");
+  ok(st.calls.find((c) => c.n === "tabs.group").a.createProperties.windowId === 7, "tabs.group got createProperties.windowId = the tab's window");
   ok((await S.attach("A", { tabId: 1 })).already === true, "re-attach is a no-op");
   const e = await rejects(S.attach("A", { match: "docs" }));
   ok(/matches 2 tabs/.test(e) && /2:/.test(e) && /3:/.test(e), "ambiguous match lists candidates");
@@ -137,16 +144,19 @@ console.log("== session_end: close created, only ungroup attached ==");
   ok((await S.endSession("nope")).closed.length === 0, "ending an unknown session is a no-op");
 }
 
-console.log("== idle sweep ==");
+console.log("== idle sweep (M2: runs with the host connected; live sessions never swept) ==");
 {
   let t = 1000;
   const { S, st } = mk([], { now: () => t });
-  await S.createTab("A");
+  await S.createTab("A"); await S.createTab("B");
   t += 29 * 60000;
-  ok((await S.sweepIdle(false)).length === 0, "not idle yet");
+  ok((await S.sweepIdle()).length === 0, "not idle yet");
   t += 2 * 60000;
-  ok((await S.sweepIdle(true)).length === 0, "host connected: never swept");
-  ok((await S.sweepIdle(false)).join() === "A" && st.tabs.length === 0, "idle 30 min, no host: ended, created tab closed");
+  await S.noteAlive(["B", "nobody"]); // host says B's client is still connected
+  ok(!S.sessions.has("nobody"), "noteAlive never creates a session");
+  ok((await S.sweepIdle()).join() === "A" && st.tabs.length === 1, "A (silent 31 min) ended and its tab closed; B (alive) kept");
+  await S.touch("B"); t += 29 * 60000;
+  ok((await S.sweepIdle()).length === 0, "recent request keeps a session");
 }
 
 console.log("== persistence + reconcile ==");
@@ -165,13 +175,72 @@ console.log("== persistence + reconcile ==");
   ok(st.groups[C.groupId].title === "Claude 2", "freed index reused");
 }
 
+console.log("== H2/L10: group created in the tab's window while ANOTHER window is focused ==");
+{
+  const { S, st } = mk([{ id: 1, windowId: 7, title: "Gmail" }]);
+  st.focusedWindow = 1;
+  await S.attach("A", { tabId: 1 });
+  ok(st.tabs.find((t) => t.id === 1).windowId === 7, "attached tab not pulled into the focused window");
+  const made = await S.createTab("B");
+  ok(made.tab.windowId === 50 && st.groups[made.groupId].windowId === 50, "created tab not pulled out of its fresh window");
+}
+
+console.log("== L2: concurrent context(createIfEmpty) makes one tab ==");
+{
+  const { S, st } = mk();
+  const rs = await Promise.all([S.context("A", true), S.context("A", true), S.context("A", true)]);
+  ok(st.tabs.length === 1 && rs.every((r) => r.tabs.length === 1), "one tab, every caller sees it");
+}
+
+console.log("== L7: touch before load cannot steal a restored session's index ==");
+{
+  const { chrome, S } = mk();
+  await S.createTab("A"); // A holds index 1 in storage
+  const S2 = createSessions(chrome); // worker restart
+  S2.touch("B"); // arrives before load()
+  await Promise.resolve();
+  ok(!S2.sessions.has("B"), "touch before load() registers nothing (no index taken from an unloaded map)");
+  await S2.load(); await S2.createTab("B");
+  ok(S2.sessions.get("A").index === 1 && S2.sessions.get("B").index === 2, "restored A keeps 1, new B gets 2");
+}
+
+console.log("== M8: attach remembers the user's group + pin; detach and session end restore them ==");
+{
+  const mkw = () => {
+    const m = mk([{ id: 1, windowId: 7, groupId: 300, title: "Jira" }, { id: 2, windowId: 7, groupId: 300, title: "Wiki" }, { id: 3, windowId: 7, pinned: true, title: "Mail" }, { id: 4, windowId: 7, groupId: 301, title: "Gone" }]);
+    userGroup(m.st, 300, 7); userGroup(m.st, 301, 7);
+    return m;
+  };
+  const { S, st } = mkw();
+  await S.attach("A", { tabId: 1 }); await S.attach("A", { tabId: 3 });
+  ok(st.tabs.find((t) => t.id === 1).groupId !== 300 && st.tabs.find((t) => t.id === 3).pinned === false, "attach moved it (precondition: grouping unpinned the pinned tab)");
+  await S.detach("A", 1);
+  ok(st.tabs.find((t) => t.id === 1).groupId === 300, "detach: back in the user's own group");
+  await S.detach("A", 3);
+  ok(st.tabs.find((t) => t.id === 3).pinned === true && st.tabs.find((t) => t.id === 3).groupId === -1, "detach: pinned again, not grouped");
+  const m2 = mkw();
+  await m2.S.attach("A", { tabId: 1 }); await m2.S.attach("A", { tabId: 3 }); await m2.S.attach("A", { tabId: 4 });
+  delete m2.st.groups[301]; // the user's group no longer exists
+  await m2.S.endSession("A");
+  const g = (id) => m2.st.tabs.find((t) => t.id === id);
+  ok(g(1).groupId === 300 && g(3).pinned === true && g(4).groupId === -1, "session end: group restored, re-pinned, vanished group falls back to ungrouped");
+  const m3 = mkw();
+  await m3.S.attach("A", { tabId: 1 }); await m3.S.attach("B", { tabId: 1, steal: true }); await m3.S.detach("B", 1);
+  ok(m3.st.tabs.find((t) => t.id === 1).groupId === 300, "steal passes the original group on to the new owner");
+  const m4 = mkw(); const S4b = createSessions(m4.chrome);
+  await m4.S.attach("A", { tabId: 3 });
+  await S4b.endSession("A");
+  ok(m4.st.tabs.find((t) => t.id === 3).pinned === true, "restore info survives a worker restart");
+}
+
 console.log("== listAll ==");
 {
   const { S } = mk([{ id: 1, windowId: 7, title: "u", url: "x" }]);
   await S.attach("A", { tabId: 1 }); await S.createTab("B");
   const l = await S.listAll("A");
-  ok(l.length === 2 && l.find((t) => t.tabId === 1).session === "A" && l.find((t) => t.tabId === 1).mine, "owner + mine reported");
-  ok(l.find((t) => t.tabId !== 1).session === "B" && !l.find((t) => t.tabId !== 1).mine, "other session's tab flagged");
+  ok(l.length === 2 && l.find((t) => t.tabId === 1).session === "Claude" && l.find((t) => t.tabId === 1).mine, "owner + mine reported");
+  const other = l.find((t) => t.tabId !== 1);
+  ok(other.session === "Claude 2" && !other.mine && !JSON.stringify(l).includes('"B"'), "other session's tab flagged by group title, raw session id not leaked");
 }
 
 process.exit(fail ? 1 : 0);

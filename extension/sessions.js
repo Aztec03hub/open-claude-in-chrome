@@ -19,8 +19,9 @@ export const sidOf = (raw) => (raw === undefined || raw === null || raw === "" ?
 const titleFor = (index) => (index === 1 ? "Claude" : `Claude ${index}`);
 const colorFor = (index) => COLORS[(index - 1) % COLORS.length];
 
-export function createSessions(chrome, { now = Date.now, onRelease = async () => {} } = {}) {
-  // sid -> { index, groupIds: number[], created: Set<tabId>, attached: Set<tabId>, lastSeen }
+export function createSessions(chrome, { now = Date.now, onRelease = async () => {}, dbg = () => {} } = {}) {
+  // sid -> { index, groupIds: number[], created: Set<tabId>, attached: Set<tabId>, lastSeen,
+  //          restore: Map<tabId, {groupId, pinned}> }  (what an attached tab looked like before we took it)
   const sessions = new Map();
   const locks = new Map();
   let loaded = null;
@@ -36,9 +37,9 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
   async function persist() {
     const out = {};
     for (const [sid, s] of sessions) {
-      out[sid] = { index: s.index, groupIds: s.groupIds, created: [...s.created], attached: [...s.attached], lastSeen: s.lastSeen };
+      out[sid] = { index: s.index, groupIds: s.groupIds, created: [...s.created], attached: [...s.attached], lastSeen: s.lastSeen, restore: Object.fromEntries(s.restore) };
     }
-    try { await chrome.storage.session.set({ [STORAGE_KEY]: out }); } catch {}
+    try { await chrome.storage.session.set({ [STORAGE_KEY]: out }); } catch (e) { dbg("sessions", "persist failed", { err: String(e && e.message).slice(0, 120) }); }
   }
 
   function get(sid, create = true) {
@@ -47,7 +48,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
       const used = new Set([...sessions.values()].map((x) => x.index));
       let index = 1;
       while (used.has(index)) index++;
-      s = { index, groupIds: [], created: new Set(), attached: new Set(), lastSeen: now() };
+      s = { index, groupIds: [], created: new Set(), attached: new Set(), lastSeen: now(), restore: new Map() };
       sessions.set(sid, s);
     }
     return s;
@@ -83,7 +84,9 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
         for (const [sid, r] of Object.entries(saved)) {
           sessions.set(sid, {
             index: r.index, groupIds: r.groupIds || [], created: new Set(r.created || []),
-            attached: new Set(r.attached || []), lastSeen: r.lastSeen || now()
+            attached: new Set(r.attached || []), restore: new Map(Object.entries(r.restore || {}).map(([k, v]) => [Number(k), v])),
+            // The persisted lastSeen can be hours old after a worker restart; restart the idle clock.
+            lastSeen: now()
           });
         }
         for (const [sid, s] of [...sessions]) {
@@ -91,6 +94,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
           const ids = new Set(live.flatMap((g) => g.tabs.map((t) => t.id)));
           s.created = new Set([...s.created].filter((t) => ids.has(t)));
           s.attached = new Set([...s.attached].filter((t) => ids.has(t)));
+          for (const k of [...s.restore.keys()]) if (!s.attached.has(k)) s.restore.delete(k);
           if (!live.length) sessions.delete(sid);
         }
         await persist();
@@ -99,7 +103,14 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     return loaded;
   }
 
-  const touch = (sid) => { const s = get(sid); s.lastSeen = now(); };
+  // Waits for load(): before it, a new session could take an index a restored one holds.
+  const touch = (sid) => load().then(() => { get(sid).lastSeen = now(); });
+
+  // The host reports which sessions still have a live client; keep those alive.
+  async function noteAlive(sids) {
+    await load();
+    for (const sid of sids) { const s = sessions.get(sid); if (s) s.lastSeen = now(); }
+  }
 
   async function ownedTabs(sid) {
     await load();
@@ -123,9 +134,11 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     );
   }
 
-  async function newGroup(sid, tabId) {
+  // windowId is explicit: without it Chrome puts the new group in the "current"
+  // window and drags the tab there.
+  async function newGroup(sid, tabId, windowId) {
     const s = get(sid);
-    const groupId = await chrome.tabs.group({ tabIds: [tabId] });
+    const groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId } });
     try { await chrome.tabGroups.update(groupId, { title: titleFor(s.index), color: colorFor(s.index) }); } catch {}
     s.groupIds.push(groupId);
     return groupId;
@@ -135,36 +148,40 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
   // (not focused); later tabs go in the session's most recent group's window,
   // never selected.
   function createTab(sid) {
-    return serial(sid, async () => {
-      await load();
-      touch(sid);
-      const s = get(sid);
-      const groups = await liveGroups(sid);
-      let tab, groupId;
-      if (!groups.length) {
-        const win = await chrome.windows.create({ focused: false, url: "about:blank" });
-        tab = win.tabs[0];
-        groupId = await newGroup(sid, tab.id);
-      } else {
-        const g = groups[groups.length - 1];
-        tab = await chrome.tabs.create({ active: false, windowId: g.windowId });
-        groupId = await chrome.tabs.group({ tabIds: [tab.id], groupId: g.groupId });
-      }
-      s.created.add(tab.id);
-      await persist();
-      return { tab, groupId };
-    });
+    return serial(sid, () => createTabLocked(sid));
   }
 
-  // tabs_context_mcp: list owned tabs; only create when nothing is owned.
+  async function createTabLocked(sid) {
+    await load();
+    await touch(sid);
+    const s = get(sid);
+    const groups = await liveGroups(sid);
+    let tab, groupId;
+    if (!groups.length) {
+      const win = await chrome.windows.create({ focused: false, url: "about:blank" });
+      tab = win.tabs[0];
+      groupId = await newGroup(sid, tab.id, win.id);
+    } else {
+      const g = groups[groups.length - 1];
+      tab = await chrome.tabs.create({ active: false, windowId: g.windowId });
+      groupId = await chrome.tabs.group({ tabIds: [tab.id], groupId: g.groupId });
+    }
+    s.created.add(tab.id);
+    await persist();
+    return { tab, groupId };
+  }
+
+  // tabs_context_mcp: list owned tabs; only create when nothing is owned. The
+  // check and the create share one lock, or two calls both see "none" and make two.
   async function context(sid, createIfEmpty) {
     await load();
-    touch(sid);
-    let groups = await liveGroups(sid);
-    if (!groups.length && createIfEmpty) {
-      await createTab(sid);
-      groups = await liveGroups(sid);
+    await touch(sid);
+    if (createIfEmpty) {
+      await serial(sid, async () => {
+        if (!(await liveGroups(sid)).length) await createTabLocked(sid);
+      });
     }
+    const groups = await liveGroups(sid);
     return { tabs: groups.flatMap((g) => g.tabs), groupId: groups.length ? groups[0].groupId : null };
   }
 
@@ -197,7 +214,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
   function attach(sid, { tabId, match, steal } = {}) {
     return serial(sid, async () => {
       await load();
-      touch(sid);
+      await touch(sid);
       const tab = await resolveAttachTarget({ tabId, match });
       const s = get(sid);
       const owner = ownerOfGroup(tab.groupId);
@@ -208,11 +225,15 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
       const mine = (await liveGroups(sid)).find((g) => g.windowId === tab.windowId);
       let groupId;
       if (mine) groupId = await chrome.tabs.group({ tabIds: [tab.id], groupId: mine.groupId });
-      else groupId = await newGroup(sid, tab.id);
+      else groupId = await newGroup(sid, tab.id, tab.windowId);
       if (owner) {
         const o = sessions.get(owner);
+        if (o.restore.has(tab.id)) s.restore.set(tab.id, o.restore.get(tab.id));
         o.created.delete(tab.id);
         o.attached.delete(tab.id);
+        o.restore.delete(tab.id);
+      } else if ((tab.groupId !== undefined && tab.groupId >= 0) || tab.pinned) {
+        s.restore.set(tab.id, { groupId: tab.groupId >= 0 ? tab.groupId : -1, pinned: !!tab.pinned });
       }
       s.attached.add(tab.id);
       s.created.delete(tab.id);
@@ -221,12 +242,29 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     });
   }
 
-  // Release a tab: ungroup, never close.
+  // Hand an attached tab back the way we found it: its own user group if that
+  // still exists (else just ungrouped), and pinned again if it was pinned.
+  async function restoreTab(s, id) {
+    const r = s.restore.get(id);
+    s.restore.delete(id);
+    let regrouped = false;
+    if (r && r.groupId >= 0) {
+      try {
+        await chrome.tabGroups.get(r.groupId);
+        await chrome.tabs.group({ tabIds: [id], groupId: r.groupId });
+        regrouped = true;
+      } catch {}
+    }
+    if (!regrouped) { try { await chrome.tabs.ungroup(id); } catch {} }
+    if (r && r.pinned) { try { await chrome.tabs.update(id, { pinned: true }); } catch {} }
+  }
+
+  // Release a tab: ungroup (or back to its old group), never close.
   function detach(sid, tabId) {
     return serial(sid, async () => {
       const tab = await assertTabOwned(sid, tabId);
-      await chrome.tabs.ungroup(tab.id);
       const s = get(sid);
+      await restoreTab(s, tab.id);
       s.created.delete(tab.id);
       s.attached.delete(tab.id);
       await onRelease(tab.id);
@@ -248,7 +286,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
       for (const id of closed) await onRelease(id);
       if (closed.length) await chrome.tabs.remove(closed);
       const s = get(sid);
-      for (const id of closed) { s.created.delete(id); s.attached.delete(id); }
+      for (const id of closed) { s.created.delete(id); s.attached.delete(id); s.restore.delete(id); }
       await liveGroups(sid);
       await persist();
       return { closed, skipped };
@@ -264,7 +302,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
       const owner = ownerOfGroup(t.groupId);
       return {
         tabId: t.id, windowId: t.windowId, title: t.title || "", url: t.url || "", active: !!t.active,
-        session: owner, mine: owner === sid
+        session: owner === null ? null : titleFor(sessions.get(owner).index), mine: owner === sid
       };
     });
   }
@@ -280,7 +318,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
       for (const id of s.created) if (owned.has(id)) closed.push(id);
       for (const id of s.attached) if (owned.has(id)) ungrouped.push(id);
       for (const id of [...closed, ...ungrouped]) await onRelease(id);
-      for (const id of ungrouped) { try { await chrome.tabs.ungroup(id); } catch {} }
+      for (const id of ungrouped) await restoreTab(s, id);
       if (closed.length) { try { await chrome.tabs.remove(closed); } catch {} }
       sessions.delete(sid);
       await persist();
@@ -288,9 +326,10 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     });
   }
 
-  // Backstop for a session whose client vanished without session_end.
-  async function sweepIdle(hostConnected, idleMs = IDLE_MS) {
-    if (hostConnected) return [];
+  // Backstop for a session whose client vanished without session_end. Live
+  // clients are kept fresh by touch() on every request and by noteAlive() from
+  // the host, so only silent sessions reach idleMs.
+  async function sweepIdle(idleMs = IDLE_MS) {
     await load();
     const ended = [];
     for (const [sid, s] of [...sessions]) {
@@ -304,7 +343,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     await load();
     let dirty = false;
     for (const s of sessions.values()) {
-      dirty = s.created.delete(tabId) || s.attached.delete(tabId) || dirty;
+      dirty = s.created.delete(tabId) || s.attached.delete(tabId) || s.restore.delete(tabId) || dirty;
     }
     if (dirty) await persist();
   }
@@ -323,7 +362,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
   }
 
   return {
-    sessions, load, touch, ownedTabs, assertTabOwned, createTab, context, attach, detach, close,
+    sessions, load, touch, noteAlive, ownedTabs, assertTabOwned, createTab, context, attach, detach, close,
     listAll, endSession, sweepIdle, onTabRemoved, isManaged, allManagedTabIds
   };
 }
