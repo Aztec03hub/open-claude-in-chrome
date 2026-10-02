@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6VGDuwFolUM7RiGblgS26uB73+zp+t+zxASA5uXxFFSmWz1OyP171tuU8Mhq4Z56gZXkZR3/SkQ3YCiemlOHAy05rvmRPQZPHNTnpZOl0dHF419PgdSbqviTihfPrdsXmzkhfzKwiUXL1gUJ6N0+HnbFQ780v5MP1W6yG7csu7NJAVM7qnKRhT66Ih411+P+rjL/ehIAc935XSgtWWqQvzB7Cvbyyw2v+hMegrUb0Jk3iJ9WRjfpo53BWrsYRoYtAIRBMuONUJSJOHYbtP3hJoWNFMTme+mXA190Z83Aq53d9rKty3r0+jp8+qoDMVqemzOAAFO4PymRbOmvIV+e4wIDAQAB",
   "name": "Open Claude in Chrome",
   "version": "1.0.0",
   "description": "Claude in Chrome, open source. No domain blocklist. Any Chromium browser.",
