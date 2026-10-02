@@ -141,7 +141,7 @@ function connect() {
 
   sock.on("connect", () => {
     established = true;
-    sock.write(JSON.stringify({ type: "client_hello" }) + "\n");
+    sock.write(JSON.stringify({ type: "client_hello", session_id: SESSION_ID }) + "\n");
     process.stderr.write(`Joined the browser bridge at ${PIPE_PATH}\n`);
   });
 
@@ -283,14 +283,14 @@ export async function callTool(toolName, args) {
   noteActivity();
   try {
     let coerced = coerceArgs(args ?? {});
-    if (toolName === "file_upload") coerced = await filesFromPaths(coerced);
+    if (toolName === "file_upload") coerced = await filesFromPaths(coerced, { wsl: WSL });
     // browser_batch carries nested tool inputs; coerce each the same way, and
-    // turn nested file_upload paths into file contents like the top level.
+    // map nested file_upload paths to Windows paths like the top level.
     if (toolName === "browser_batch" && Array.isArray(coerced.actions)) {
       for (const a of coerced.actions) {
         if (!a || typeof a.input !== "object") continue;
         coerceArgs(a.input);
-        if (a.name === "file_upload") a.input = await filesFromPaths(a.input);
+        if (a.name === "file_upload") a.input = await filesFromPaths(a.input, { wsl: WSL });
       }
     }
     // `find` is model-backed: the model call runs here (WSL side), not in the browser.

@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 
 import { isWsl, windowsPipePath, windowsUser, relayStream, findWindowsNode, RELAY_JS } from "../wsl-transport.js";
 import { filesFromPaths } from "../file-upload.js";
+import { nativeSizeError } from "../native-limit.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "occ-wsl-"));
@@ -81,23 +82,41 @@ test("relayStream: connect on 'ok', pure data both ways, close with child", asyn
   assert.equal(child.killed, true);
 });
 
-test("file_upload: paths -> files base64; native windows keeps paths; size cap", async () => {
+test("file_upload (H1): under WSL paths become Windows paths via wslpath -w, no bytes; elsewhere untouched", async () => {
   const f = path.join(tmp, "a.png");
-  fs.writeFileSync(f, Buffer.from([1, 2, 3]));
-  const out = await filesFromPaths({ paths: [f], ref: "ref_1", tabId: 5 }, { platform: "linux" });
-  assert.deepEqual(out, { ref: "ref_1", tabId: 5, files: [{ name: "a.png", mimeType: "image/png", base64: "AQID" }] });
+  fs.writeFileSync(f, Buffer.alloc(3 * 1024 * 1024, 1)); // 3 MB: would blow Chrome's 1 MB message cap if inlined
+  const seenPaths = [];
+  const toWindowsPath = async (p) => (seenPaths.push(p), "\\\\wsl.localhost\\Ubuntu" + p.replaceAll("/", "\\"));
+  const out = await filesFromPaths({ paths: [f], ref: "ref_1", tabId: 5 }, { wsl: true, toWindowsPath });
+  assert.deepEqual(seenPaths, [f]);
+  assert.equal(out.files, undefined, "no inline bytes");
+  assert.deepEqual(out, { ref: "ref_1", tabId: 5, paths: ["\\\\wsl.localhost\\Ubuntu" + f.replaceAll("/", "\\")] });
+  assert.ok(JSON.stringify(out).length < 1024, "request stays tiny");
+  // native Linux / macOS / Windows: exactly upstream (same object, paths passed through)
+  const native = { paths: [f], ref: "r" };
+  assert.equal(await filesFromPaths(native, { wsl: false }), native);
+  assert.equal(await filesFromPaths(native), native);
   const win = { paths: ["C:\\x.txt"], ref: "r" };
-  assert.equal(await filesFromPaths(win, { platform: "win32" }), win);
-  await assert.rejects(filesFromPaths({ paths: [f] }, { platform: "linux", max: 2 }), /exceeds/);
-  await assert.rejects(filesFromPaths({ paths: [path.join(tmp, "nope")] }, { platform: "linux" }), /Cannot read/);
+  assert.equal(await filesFromPaths(win, { wsl: false }), win);
+  await assert.rejects(filesFromPaths({ paths: [path.join(tmp, "nope")] }, { wsl: true, toWindowsPath }), /Cannot read/);
+  await assert.rejects(filesFromPaths({ paths: [tmp] }, { wsl: true, toWindowsPath }), /Not a file/);
+});
+
+test("native-limit (H1): an oversized native message is refused with a clear error", () => {
+  assert.equal(nativeSizeError({ type: "tool_request", args: { paths: ["C:\\x"] } }), null);
+  const big = nativeSizeError({ type: "tool_request", args: { files: [{ base64: "A".repeat(1_200_000) }] } });
+  assert.match(big, /limit for a single message to the browser; nothing was sent/);
+  assert.match(big, /paths/);
 });
 
 // End to end: tool-runtime in WSL mode, with a fake "node.exe" that runs the
 // real relay script against a unix-socket fake host. Checks the relay framing,
 // session_id on the request and session_end on shutdown.
-test("runtime over the relay: session_id stamped, files forwarded, session_end sent", async () => {
+test("runtime over the relay: session_id stamped, windows paths forwarded, session_end sent", async () => {
   const sock = path.join(tmp, "host.sock");
   const fakeNode = path.join(tmp, "fake-node.sh");
+  const fakeWslpath = path.join(tmp, "fake-wslpath.sh"); // stands in for `wslpath -w <p>`
+  fs.writeFileSync(fakeWslpath, `#!/bin/sh\necho "WIN:$(basename "$2")"\n`, { mode: 0o755 });
   fs.writeFileSync(fakeNode, `#!/bin/sh\nexec "${process.execPath}" "$1" "$2" "${sock}"\n`, { mode: 0o755 });
   const seen = [];
   let srv;
@@ -127,7 +146,7 @@ test("runtime over the relay: session_id stamped, files forwarded, session_end s
     console.log(JSON.stringify({ r, SESSION_ID }));
     shutdown(); process.exit(0);`;
   const p = spawn(process.execPath, ["--input-type=module", "-e", script], {
-    env: { ...process.env, OCIC_WSL: "1", OCIC_WIN_NODE: fakeNode, OCIC_SESSION_ID: "sess-123", USER: "u" }
+    env: { ...process.env, OCIC_WSL: "1", OCIC_WIN_NODE: fakeNode, OCIC_SESSION_ID: "sess-123", USER: "u", OCIC_WSLPATH: fakeWslpath }
   });
   let stdout = "";
   p.stdout.on("data", (d) => (stdout += d));
@@ -138,8 +157,9 @@ test("runtime over the relay: session_id stamped, files forwarded, session_end s
   assert.equal(seen[0].type, "client_hello");
   assert.equal(req.session_id, "sess-123");
   assert.equal(req.tool, "file_upload");
-  assert.equal(req.args.paths, undefined);
-  assert.deepEqual(req.args.files, [{ name: "up.txt", mimeType: "text/plain", base64: "aGk=" }]);
+  assert.equal(seen[0].session_id, "sess-123", "client_hello carries the session id");
+  assert.equal(req.args.files, undefined);
+  assert.deepEqual(req.args.paths, ["WIN:up.txt"]);
   assert.deepEqual(seen.at(-1), { type: "session_end", session_id: "sess-123" });
   assert.match(stdout, /done/);
   assert.ok(RELAY_JS.includes("process.argv[1]"));

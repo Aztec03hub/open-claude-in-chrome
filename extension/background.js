@@ -129,8 +129,9 @@ chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
     if (!nativePort) connectNativeHost();
-    // Backstop: sessions idle 30 min with no host connection are ended.
-    sessionTabs.sweepIdle(!!nativePort).catch(() => {});
+    // Backstop: a session silent for 30 min (no request, and the host no longer
+    // lists it as alive) is ended, host connected or not.
+    sessionTabs.sweepIdle().catch(() => {});
   }
 });
 
@@ -154,6 +155,9 @@ function connectNativeHost() {
       } else if (msg.type === "session_end") {
         // Client session over: close tabs it created, ungroup tabs it attached.
         sessionTabs.endSession(sidOf(msg.session_id)).catch(() => {});
+      } else if (msg.type === "sessions_alive") {
+        // Host heartbeat: the session_ids that still have a connected client.
+        sessionTabs.noteAlive(Array.isArray(msg.session_ids) ? msg.session_ids.map(sidOf) : []).catch(() => {});
       } else if (msg.type === "recording_saved") {
         // Reply from the native host after writing a recording bundle to disk.
         const resolve = recorder.pendingSaves.get(String(msg.recording_id));
@@ -271,6 +275,7 @@ function nativeRequest(msg) {
 // tab IDs are: ...". handleToolRequest runs it for every tool carrying a
 // tabId; browser_batch must call it per sub-call (sessions.assertTabOwned).
 const sessionTabs = createSessions(chrome, {
+  dbg: (...a) => dbg(...a),
   // Never leave a CDP debugger (and its infobar) on a tab we stop managing.
   onRelease: async (tabId) => {
     if (attachedTabs.has(tabId)) {

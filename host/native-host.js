@@ -16,6 +16,8 @@ import {
   clearStaleSocket,
   secureSocket
 } from "./endpoint.js";
+import { createSessionTracker } from "./session-tracker.js";
+import { nativeSizeError } from "./native-limit.js";
 
 // --- Native messaging protocol (Chrome <-> this process) ---
 
@@ -76,6 +78,18 @@ const clients = new Map(); // clientId -> socket
 const clientRequestMap = new Map(); // prefixed id -> { clientId, originalId }
 let clientIdCounter = 0;
 
+// Which sessions still have a connected client; see session-tracker.js. The
+// extension ends sessions that stop being reported (client killed without a
+// session_end) and is told which are alive so quiet ones are never swept.
+const sessionTracker = createSessionTracker({
+  send: writeNativeMessage,
+  graceMs: Number(process.env.OCIC_SESSION_GRACE_MS) || 60_000
+});
+setInterval(() => {
+  const ids = sessionTracker.alive();
+  if (ids.length) writeNativeMessage({ type: "sessions_alive", session_ids: ids });
+}, Number(process.env.OCIC_ALIVE_MS) || 15_000).unref();
+
 const RETRY_MS = 1500;
 const REJECTED_RETRY_MS = 15000;
 // A peer that has connected but not yet said what it is. A real client sends
@@ -120,7 +134,7 @@ function onIncomingConnection(socket) {
     socket.removeListener("data", onEarlyData);
 
     if (msg && msg.type === "client_hello") {
-      attachClient(socket, rest);
+      attachClient(socket, rest, msg.session_id);
       return;
     }
     socket.destroy();
@@ -160,9 +174,10 @@ async function claimPipe() {
   });
 }
 
-function attachClient(socket, initialBuffer) {
+function attachClient(socket, initialBuffer, sessionId) {
   const clientId = String(++clientIdCounter);
   clients.set(clientId, socket);
+  sessionTracker.seen(clientId, sessionId);
   process.stderr.write(`MCP client ${clientId} attached (${clients.size} total)\n`);
   socket.write(JSON.stringify({ type: "client_ack", clientId }) + "\n");
 
@@ -180,9 +195,18 @@ function attachClient(socket, initialBuffer) {
           // Namespace the id so concurrent sessions cannot collide, and so a
           // response can be routed back to the one client that asked.
           const prefixedId = `h${clientId}_${msg.id}`;
+          sessionTracker.seen(clientId, msg.session_id);
+          const out = { ...msg, id: prefixedId };
+          // An oversized frame would make Chrome drop the port for every session.
+          const tooBig = nativeSizeError(out);
+          if (tooBig) {
+            socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: tooBig }) + "\n");
+            continue;
+          }
           clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
-          writeNativeMessage({ ...msg, id: prefixedId });
+          writeNativeMessage(out);
         } else if (msg.type === "session_end" && msg.session_id) {
+          sessionTracker.ended(msg.session_id);
           writeNativeMessage(msg);
         }
       } catch {
@@ -198,6 +222,7 @@ function attachClient(socket, initialBuffer) {
   });
   socket.on("close", () => {
     clients.delete(clientId);
+    sessionTracker.closed(clientId);
     for (const [prefixedId, info] of clientRequestMap) {
       if (info.clientId === clientId) clientRequestMap.delete(prefixedId);
     }
