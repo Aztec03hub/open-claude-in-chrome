@@ -11,6 +11,7 @@ import { formatExceptionEntry } from "./tools/console.js";
 import { validateFiles, setFilesInPage, dropFileInPage, mimeFromBase64 } from "./tools/upload.js";
 import { createDialogLog, maybeHandleDialog, answerPendingDialog, withDialogNotes } from "./tools/dialogs.js";
 import { createInFlight } from "./tools/inflight.js";
+import { formatTabList } from "./tools/tablist.js";
 import { failedRecord, formatNetworkLine, isCrossDomain } from "./tools/network.js";
 import { looksLikeError } from "./tools/batch.js";
 import { err } from "./tools/result.js";
@@ -1311,10 +1312,7 @@ const toolHandlers = {
   // Every open tab in the browser, with the session group (if any) owning it.
   async tabs_list_all(args, sid) {
     const tabs = await sessionTabs.listAll(sid);
-    const text = tabs
-      .map((t) => `  \u2022 tabId ${t.tabId} (window ${t.windowId})${t.active ? " [active]" : ""}${t.session ? ` [session: ${t.session}${t.mine ? ", yours" : ""}]` : ""}: "${t.title}" (${t.url})`)
-      .join("\n");
-    return { content: [{ type: "text", text: JSON.stringify({ tabs }) + "\n\nAll open tabs:\n" + text }] };
+    return { content: [{ type: "text", text: formatTabList(tabs, { match: args && args.match, limit: args && args.limit }) }] };
   },
 
   // Take over an EXISTING tab: grouped in place, never reloaded or moved.

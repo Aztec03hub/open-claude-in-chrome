@@ -32,8 +32,11 @@ export const TOOLS = [
   {
     name: "tabs_list_all",
     description:
-      "List EVERY open tab in the browser (all windows): tabId, windowId, title, url, active, and which session's tab group (if any) it belongs to. Read-only; does not change anything. Use it to find an existing tab, then tabs_attach_mcp to take it over.",
-    paramShape: {}
+      "List open tabs in the browser (all windows), one line each: tabId, window, title, url (long URLs shortened), active, and which session's tab group (if any) it belongs to. Read-only. Pass `match` to filter by a substring of the url or title. Use it to find an existing tab, then tabs_attach_mcp to take it over.",
+    paramShape: {
+      match: z.string().optional().describe("Case-insensitive substring of the tab's full URL or title; only matching tabs are listed."),
+      limit: z.number().optional().describe("Maximum number of tabs to list (default 200).")
+    }
   },
   {
     name: "tabs_attach_mcp",
