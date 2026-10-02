@@ -17,23 +17,35 @@
 // without going through a child mcp-server.js + stdio MCP roundtrip.
 
 import net from "node:net";
+import crypto from "node:crypto";
 
 import { getPipePath } from "./endpoint.js";
 import { noteActivity } from "./parent-watch.js";
+import { isWsl, windowsPipePath, connectViaWindowsNode } from "./wsl-transport.js";
+import { filesFromPaths } from "./file-upload.js";
 
-const PIPE_PATH = getPipePath();
+// Under WSL the host's pipe is a Windows named pipe, reached through a Windows
+// node.exe relay child (wsl-transport.js).
+// A unix-path OCIC_PIPE is an explicit native override (test harnesses): no relay.
+const WSL = isWsl() && !(process.env.OCIC_PIPE && !process.env.OCIC_PIPE.startsWith("\\\\.\\pipe\\"));
+const PIPE_PATH = WSL ? windowsPipePath() : getPipePath();
+
+// One id per MCP server process. The extension scopes the tabs a session owns
+// by it; a session_end message releases them.
+export const SESSION_ID = process.env.OCIC_SESSION_ID || crypto.randomUUID();
 
 const REQUEST_TIMEOUT_MS = 60_000;
 // The host dies and respawns whenever Chrome recycles the service worker, and
 // background.js reconnects 250ms later. A call landing in that window should
 // wait for the bridge to come back rather than fail.
 const LINK_GRACE_MS = 5_000;
-const RECONNECT_MS = 500;
+const RECONNECT_MS = WSL ? 1000 : 500; // each WSL retry spawns node.exe
 
 let started = false;
 let socket = null;
 let readBuffer = Buffer.alloc(0);
 let reconnectTimer = null;
+let warnedNoRelay = false;
 let shuttingDown = false;
 let requestIdCounter = 0;
 
@@ -112,7 +124,15 @@ function connect() {
   if (shuttingDown) return;
   reconnectTimer = null;
 
-  const sock = net.createConnection(PIPE_PATH);
+  let sock;
+  try {
+    sock = WSL ? connectViaWindowsNode() : net.createConnection(PIPE_PATH);
+  } catch (err) {
+    if (!warnedNoRelay) process.stderr.write(`Cannot reach the Windows bridge: ${err.message}\n`);
+    warnedNoRelay = true;
+    if (!shuttingDown && !reconnectTimer) reconnectTimer = setTimeout(connect, RECONNECT_MS);
+    return;
+  }
   socket = sock;
   readBuffer = Buffer.alloc(0);
   let established = false;
@@ -181,7 +201,7 @@ function sendToExtension(tool, args) {
     const entry = { resolve, reject, timer, sent: false };
     pendingRequests.set(id, entry);
 
-    const line = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
+    const line = JSON.stringify({ id, type: "tool_request", tool, args, session_id: SESSION_ID }) + "\n";
 
     if (linkIsUp()) {
       entry.sent = true;
@@ -260,7 +280,8 @@ function textResult(text) {
 export async function callTool(toolName, args) {
   noteActivity();
   try {
-    const coerced = coerceArgs(args ?? {});
+    let coerced = coerceArgs(args ?? {});
+    if (toolName === "file_upload") coerced = await filesFromPaths(coerced);
     const result = await sendToExtension(toolName, coerced);
     if (typeof result === "string") return textResult(result);
     if (result && result.content) return result;
@@ -285,6 +306,12 @@ export function shutdown() {
     reject(new Error("Server shutting down"));
   }
   pendingRequests.clear();
-  if (socket && !socket.destroyed) socket.destroy();
+  if (socket && !socket.destroyed) {
+    // end(), not destroy(): destroy could drop the session_end still buffered.
+    if (linkIsUp()) {
+      socket.write(JSON.stringify({ type: "session_end", session_id: SESSION_ID }) + "\n");
+      socket.end();
+    } else socket.destroy();
+  }
   socket = null;
 }

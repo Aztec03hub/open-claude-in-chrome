@@ -182,6 +182,8 @@ function attachClient(socket, initialBuffer) {
           const prefixedId = `h${clientId}_${msg.id}`;
           clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
           writeNativeMessage({ ...msg, id: prefixedId });
+        } else if (msg.type === "session_end" && msg.session_id) {
+          writeNativeMessage(msg);
         }
       } catch {
         // skip malformed
