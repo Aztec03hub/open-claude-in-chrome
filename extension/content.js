@@ -169,32 +169,36 @@
     return /(^|\s)(current-password|new-password|one-time-code|cc-[a-z-]+)(\s|$)/.test(ac);
   }
 
+  // --- Truncation (official semantics) ---
+  // Cut at the last line boundary before max and say how big the whole thing was.
+  function truncateAtLine(text, max, hint) {
+    if (text.length <= max) return text;
+    let cut = text.lastIndexOf("\n", max);
+    if (cut <= 0) cut = Math.max(0, max);
+    return `${text.slice(0, cut)}\n[output truncated at ${max} of ${text.length} characters. Pass a larger max_chars (default 50000) to see more, or ${hint}.]`;
+  }
+
+  // True when any part of the rect is inside the viewport.
+  function rectInViewport(r, vw, vh) {
+    return r.top < vh && r.bottom > 0 && r.left < vw && r.right > 0;
+  }
+
   // --- Accessibility tree generation ---
+  // filter "interactive" (and no ref_id) lists only elements in/near the
+  // viewport, like the official extension; "all" lists the whole page.
+  const MAX_TREE_ELEMENTS = 10000;
   function generateAccessibilityTree(options = {}) {
     const filter = options.filter || "all";
     const maxDepth = options.depth || 15;
     const maxChars = options.max_chars || 50000;
     const startRefId = options.ref_id || null;
+    const viewportOnly = filter === "interactive" && !startRefId;
 
-    let output = "";
-    let charCount = 0;
-    let truncated = false;
-
-    function append(text) {
-      if (truncated) return false;
-      if (charCount + text.length > maxChars) {
-        output += text.substring(0, maxChars - charCount);
-        output += "\n... (truncated)";
-        truncated = true;
-        return false;
-      }
-      output += text;
-      charCount += text.length;
-      return true;
-    }
+    const lines = [];
+    let capped = false;
 
     function walk(el, depth, indent) {
-      if (truncated) return;
+      if (capped) return;
       if (depth > maxDepth) return;
       if (!el || el.nodeType !== 1) return;
 
@@ -215,7 +219,15 @@
         (filter === "all" && (role || name)) ||
         (filter === "interactive" && interactive);
 
-      if (shouldShow && visible) {
+      const show =
+        shouldShow && visible &&
+        (!viewportOnly || rectInViewport(el.getBoundingClientRect(), window.innerWidth, window.innerHeight));
+
+      if (show) {
+        if (lines.length >= MAX_TREE_ELEMENTS) {
+          capped = true;
+          return;
+        }
         const ref = getOrAssignRef(el);
         let line = `${indent}`;
 
@@ -243,11 +255,11 @@
           if (opts.length) line += ` options=[${opts.join(", ")}]`;
         }
 
-        if (!append(line + "\n")) return;
+        lines.push(line);
       }
 
       // Recurse children (including shadow DOM)
-      const nextIndent = shouldShow && visible ? indent + "  " : indent;
+      const nextIndent = show ? indent + "  " : indent;
       if (el.shadowRoot) {
         for (const child of el.shadowRoot.children) {
           walk(child, depth + 1, nextIndent);
@@ -266,38 +278,78 @@
     }
 
     walk(root, 0, "");
-    return output;
+    let out = lines.join("\n");
+    if (capped) {
+      out += `\n[truncated at ${MAX_TREE_ELEMENTS} elements - page is very large; ${
+        startRefId ? "use a smaller depth or focus on a more specific child element" : "use a ref_id or smaller depth to focus"
+      }]`;
+    }
+    return truncateAtLine(
+      out,
+      maxChars,
+      startRefId ? "use a smaller depth or focus on a more specific child element" : "use ref_id or a smaller depth to focus"
+    );
   }
 
   // --- Page text extraction ---
-  function getPageText() {
+  // Official behaviour: innerText of the LARGEST element matching the first
+  // selector that matches anything, whitespace-normalised, cut at a line
+  // boundary at max_chars with a note giving the full size.
+  function getPageText(options = {}) {
+    const maxChars = options.max_chars || 50000;
     const selectors = [
       "article",
       "main",
       '[class*="articleBody"]',
+      '[class*="article-body"]',
       '[class*="post-content"]',
       '[class*="entry-content"]',
+      '[class*="content-body"]',
       '[role="main"]',
       ".content",
       "#content",
     ];
     let source = null;
     for (const sel of selectors) {
-      source = document.querySelector(sel);
-      if (source) break;
+      const found = document.querySelectorAll(sel);
+      if (found.length > 0) {
+        let best = found[0];
+        let bestLen = 0;
+        found.forEach((e) => {
+          const len = e.innerText?.length || 0;
+          if (len > bestLen) {
+            bestLen = len;
+            best = e;
+          }
+        });
+        source = best;
+        break;
+      }
     }
     if (!source) source = document.body;
 
     const title = document.title || "";
     const url = location.href;
-    const tag = source.tagName.toLowerCase();
-
-    // Clean text: remove script/style content, collapse whitespace
-    const clone = source.cloneNode(true);
-    clone.querySelectorAll("script, style, noscript, template, svg").forEach((el) => el.remove());
-    const text = clone.textContent.replace(/\s+/g, " ").trim();
-
-    return JSON.stringify({ title, url, sourceTag: tag, text: text.substring(0, 100000) });
+    const text = (source.innerText || "")
+      .replace(/[^\S\n]+/g, " ")
+      .replace(/ ?\n ?/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    if (!text || text.length < 10) {
+      return JSON.stringify({
+        title,
+        url,
+        sourceTag: "none",
+        error: "No text content found. Page may contain only images, videos, or canvas-based content.",
+      });
+    }
+    let out = text;
+    if (text.length > maxChars) {
+      let cut = text.lastIndexOf("\n", maxChars);
+      if (cut <= 0) cut = Math.max(0, maxChars);
+      out = `${text.slice(0, cut)}\n\n[output truncated at ${maxChars} of ${text.length} characters. Pass a larger max_chars (default 50000) to see more, or use read_page with a ref_id to focus on a smaller section.]`;
+    }
+    return JSON.stringify({ title, url, sourceTag: source.tagName.toLowerCase(), text: out });
   }
 
   // --- Element finding ---
@@ -397,17 +449,23 @@
     const tag = target.tagName.toLowerCase();
     const type = (target.type || "").toLowerCase();
 
+    let message;
     if (tag === "select") {
-      const opt = Array.from(target.options).find(
-        (o) => o.value === String(value) || o.textContent.trim() === String(value)
-      );
-      if (opt) {
-        target.value = opt.value;
-      } else {
-        target.value = String(value);
+      const wanted = String(value);
+      const opts = Array.from(target.options);
+      const opt = opts.find((o) => o.value === wanted || o.text === wanted || o.textContent.trim() === wanted);
+      if (!opt) {
+        const list = opts.map((o) => `"${o.text}" (value: "${o.value}")`).join(", ");
+        return { error: `Option "${wanted}" not found. Available options: ${list}` };
       }
+      const prev = target.value;
+      target.value = opt.value;
+      message = `Selected option "${wanted}" in dropdown (previous: "${prev}")`;
     } else if (type === "checkbox" || type === "radio") {
-      const shouldCheck = typeof value === "boolean" ? value : value === "true";
+      if (type === "checkbox" && typeof value !== "boolean" && value !== "true" && value !== "false") {
+        return { error: "Checkbox requires boolean value (true/false)" };
+      }
+      const shouldCheck = type === "radio" ? true : typeof value === "boolean" ? value : value === "true";
       if (target.checked !== shouldCheck) target.click();
       return { success: true, checked: target.checked };
     } else if (target.contentEditable === "true") {
@@ -436,7 +494,7 @@
 
     return isSensitiveInput(target)
       ? { success: true, value: "[value redacted]", sensitive: true }
-      : { success: true, value: target.value };
+      : { success: true, value: target.value, ...(message ? { message } : {}) };
   }
 
   // --- What is actually at a point ---
@@ -607,7 +665,7 @@
     }
 
     if (msg.type === "getPageText") {
-      const result = getPageText();
+      const result = getPageText(msg.options || {});
       sendResponse({ result });
       return true;
     }
