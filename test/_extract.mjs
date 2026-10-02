@@ -38,7 +38,7 @@ export function extractFunction(name, file = BACKGROUND) {
 /** Object method `async foo(args) {...}`, returned wrapped as `{ foo(){} }`. */
 export function extractMethod(name, file = BACKGROUND) {
   const src = fs.readFileSync(file, "utf8");
-  const i = src.indexOf(`  async ${name}(args)`);
+  const i = src.indexOf(`  async ${name}(args`);
   if (i === -1) throw new Error(`method ${name} not found in ${file}`);
   return src.slice(i, matchBraces(src, i)).trim();
 }

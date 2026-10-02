@@ -8,7 +8,11 @@ import { registerTools } from "./tools/register.js";
 import { buildKeyEvents } from "./tools/keys.js";
 import { runJavascript } from "./tools/js-exec.js";
 import { formatExceptionEntry } from "./tools/console.js";
-import { validateFiles, setFilesInPage } from "./tools/upload.js";
+import { validateFiles, setFilesInPage, dropFileInPage, mimeFromBase64 } from "./tools/upload.js";
+import { createDialogLog, handleDialogOpening, withDialogNotes } from "./tools/dialogs.js";
+import { failedRecord, formatNetworkLine, isCrossDomain } from "./tools/network.js";
+import { looksLikeError } from "./tools/batch.js";
+import { createIndicator, paintIndicator, INDICATOR_ID, LINGER_MS } from "./tools/indicator.js";
 
 // Prevent unhandled rejections from killing the service worker
 self.addEventListener("unhandledrejection", (event) => {
@@ -45,6 +49,8 @@ const networkRequests = new Map(); // tabId -> [{url, method, status, type, time
 // tabId -> Map<requestId, record> — lets responseReceived augment the entry
 // created by requestWillBeSent instead of recording each request twice.
 const networkByRequestId = new Map();
+const lastUrlByTab = new Map(); // tabId -> main-frame URL, to spot cross-domain navigation
+const dialogLog = createDialogLog(); // auto-handled JS dialogs, reported on the next tool result
 const screenshotStore = new Map(); // imageId -> base64
 const screenshotSaves = new Map(); // reqId -> { resolve, reject } for save_to_disk
 
@@ -363,6 +369,11 @@ async function ensureAttached(tabId) {
         { tab: tabId, err: String(e && e.message).slice(0, 120) });
     console.warn("setFocusEmulationEnabled unavailable:", e.message);
   }
+  // Page events are what tell us a JS dialog opened (see tools/dialogs.js).
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
+    attachedTabs.get(tabId)?.enabledDomains.add("Page");
+  } catch {}
   })();
   attachingTabs.set(tabId, attach);
   try {
@@ -439,6 +450,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     attachedTabs.delete(tabId);
   }
   consoleMessages.delete(tabId);
+  dialogLog.forget(tabId);
+  lastUrlByTab.delete(tabId);
   networkRequests.delete(tabId);
   networkByRequestId.delete(tabId);
   cursorByTab.delete(tabId);
@@ -485,6 +498,39 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     });
     if (msgs.length > 1000) msgs.splice(0, msgs.length - 1000);
     consoleMessages.set(tabId, msgs);
+  }
+
+  // A JS dialog blocks the renderer until answered; answer it now and report it
+  // on the next tool result for this tab so the session never wedges.
+  if (method === "Page.javascriptDialogOpening") {
+    handleDialogOpening(tabId, params, {
+      sendCommand: (m, p) => chrome.debugger.sendCommand({ tabId }, m, p),
+      log: dialogLog,
+    }).catch(() => {});
+  }
+
+  // Network and console logs describe the current domain only: a main-frame
+  // navigation to another domain starts them afresh (as the official tool
+  // descriptions promise).
+  if (method === "Page.frameNavigated" && params.frame && !params.frame.parentId) {
+    const prev = lastUrlByTab.get(tabId);
+    lastUrlByTab.set(tabId, params.frame.url);
+    if (prev && isCrossDomain(prev, params.frame.url)) {
+      // Keep requests already made to the NEW domain: the document request
+      // itself is recorded before frameNavigated fires.
+      const kept = (networkRequests.get(tabId) || []).filter((r) => isCrossDomain(prev, r.url) && !isCrossDomain(params.frame.url, r.url));
+      const byId = new Map();
+      for (const [id, rec] of networkByRequestId.get(tabId) || []) if (kept.includes(rec)) byId.set(id, rec);
+      networkRequests.set(tabId, kept);
+      networkByRequestId.set(tabId, byId);
+      consoleMessages.set(tabId, []);
+    }
+  }
+
+  // A failed load (DNS, refused, blocked...) never gets responseReceived; mark it
+  // like the official extension does (status 503) and keep the reason.
+  if (method === "Network.loadingFailed") {
+    recordNetworkEvent(tabId, params.requestId, (existing) => failedRecord(params, existing));
   }
 
   // Uncaught exceptions / unhandled rejections are not console calls.
@@ -632,7 +678,17 @@ async function resolveRefToCoordinates(tabId, ref, opts = {}) {
 const MAX_SCREENSHOT_WIDTH = 1280;
 const MAX_SCREENSHOT_HEIGHT = 800;
 
-async function takeScreenshot(tabId) {
+// Agent indicator: shown on every driven tab, hidden around screenshots so it
+// never appears in the picture.
+const indicator = createIndicator((tabId, show) =>
+  chrome.scripting.executeScript({ target: { tabId }, func: paintIndicator, args: [show, INDICATOR_ID, LINGER_MS] })
+);
+
+function takeScreenshot(tabId) {
+  return indicator.hidden(tabId, () => takeScreenshotRaw(tabId));
+}
+
+async function takeScreenshotRaw(tabId) {
   await ensureAttached(tabId);
 
   // Capture at EXACTLY CSS-pixel dimensions, because the agent reads click
@@ -1309,8 +1365,16 @@ const toolHandlers = {
     return result;
   },
 
-  async navigate(args) {
-    const { url, tabId } = args;
+  async navigate(args, sid) {
+    const { url } = args;
+    let { tabId } = args;
+    // No tabId: use (creating if needed) this session's group, like the official
+    // extension's implicit tabs_context_mcp {createIfEmpty:true}.
+    if (tabId === undefined || tabId === null) {
+      const { tabs } = await sessionTabs.context(sid, true);
+      tabId = tabs[0] && tabs[0].id;
+      if (tabId === undefined) return { content: [{ type: "text", text: "Error: no tab available to navigate; use tabs_context_mcp {createIfEmpty:true} or tabs_attach_mcp first." }] };
+    }
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     if (url === "back") {
@@ -1769,16 +1833,17 @@ const toolHandlers = {
     const { tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
-    const resp = await sendContentMessage(tabId, { type: "getPageText" });
+    const resp = await sendContentMessage(tabId, { type: "getPageText", options: { max_chars: args.max_chars } });
     if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
 
     try {
       const data = JSON.parse(resp.result);
+      if (data.error) return { content: [{ type: "text", text: `Error: ${data.error}` }] };
       return {
         content: [
           {
             type: "text",
-            text: `Title: ${data.title}\nURL: ${data.url}\nSource: <${data.sourceTag}>\n\n${data.text}`,
+            text: `Title: ${data.title}\nURL: ${data.url}\nSource element: <${data.sourceTag}>\n---\n${data.text}`,
           },
         ],
       };
@@ -1831,6 +1896,7 @@ const toolHandlers = {
     if (result?.error) return { content: [{ type: "text", text: `Error: ${result.error}` }] };
     // Do not echo a secret back: content.js flags password / card fields.
     if (result?.sensitive) return { content: [{ type: "text", text: `Set ${ref} to "[value redacted]". Result: ${JSON.stringify(result)}` }] };
+    if (result?.message) return { content: [{ type: "text", text: result.message }] };
     return { content: [{ type: "text", text: `Set ${ref} to "${value}". Result: ${JSON.stringify(result)}` }] };
   },
 
@@ -1981,7 +2047,7 @@ const toolHandlers = {
     }
 
     const text = reqs
-      .map((r) => `${r.method} ${r.url} ${r.status ? `→ ${r.status}` : "(pending)"}${r.mimeType ? ` [${r.mimeType}]` : ""}`)
+      .map(formatNetworkLine)
       .join("\n");
 
     return { content: [{ type: "text", text: `Network requests (${reqs.length}):\n${text}` }] };
@@ -2156,15 +2222,37 @@ const toolHandlers = {
   },
 
   async upload_image(args) {
-    const { imageId, tabId, ref, filename = "image.png" } = args;
+    const { imageId, tabId, ref, coordinate, filename = "image.png" } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
-    if (!ref) {
-      return { content: [{ type: "text", text: "upload_image requires 'ref' (element reference from read_page/find) identifying the target <input type=file>." }] };
+    if (!imageId) return { content: [{ type: "text", text: "Error: imageId parameter is required" }] };
+    if (!ref && !coordinate) {
+      return { content: [{ type: "text", text: "Error: Either ref or coordinate parameter is required. Provide ref for targeting specific elements or coordinate for drag & drop to a location." }] };
+    }
+    if (ref && coordinate) {
+      return { content: [{ type: "text", text: "Error: Provide either ref or coordinate, not both. Use ref for specific elements or coordinate for drag & drop." }] };
     }
 
     const base64 = screenshotStore.get(imageId);
     if (!base64) {
       return { content: [{ type: "text", text: `Image ${imageId} not found. Take a screenshot first.` }] };
+    }
+
+    // Drop onto whatever is at the point (screenshots are 1:1 CSS pixels, so the
+    // coordinate is used as given), like dragging the file in by hand.
+    if (coordinate) {
+      if (!Array.isArray(coordinate) || coordinate.length !== 2 || !coordinate.every((n) => Number.isFinite(Number(n)))) {
+        return { content: [{ type: "text", text: "Error: coordinate must be [x, y]" }] };
+      }
+      const [x, y] = coordinate.map(Number);
+      const res = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: dropFileInPage,
+        args: [base64, filename, mimeFromBase64(base64), x, y]
+      });
+      const r = res && res[0] && res[0].result;
+      if (!r || !r.ok) return { content: [{ type: "text", text: `Error: upload_image failed: ${(r && r.error) || "no result from page"}` }] };
+      return { content: [{ type: "text", text: `Successfully dropped ${filename} (${r.kb}KB) on <${r.tag}> at (${x}, ${y})` }] };
     }
 
     await ensureAttached(tabId);
@@ -2578,6 +2666,16 @@ const SELF_CHECKED_TOOLS = new Set(["tabs_attach_mcp", "tabs_detach_mcp", "tabs_
 registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore, assertTabOwned, selfChecked: SELF_CHECKED_TOOLS });
 
 // --- Tool dispatch ---
+// Central result post-processing for every tool call: flag error results with
+// isError (handlers mostly report failures as plain text), and tell the agent
+// about any JS dialog that was auto-handled on the tab meanwhile.
+function finishResult(result, args) {
+  let out = result;
+  if (out && typeof out === "object" && !out.isError && looksLikeError(out)) out = { ...out, isError: true };
+  if (args && typeof args.tabId === "number") out = withDialogNotes(out, dialogLog.drain(args.tabId));
+  return out;
+}
+
 async function handleToolRequest(id, tool, args, sessionId) {
   // recording_ack arrives from the MCP server when Claude confirms receipt of
   // a recording_complete event. Mark it delivered so stopRecording() can
@@ -2602,10 +2700,12 @@ async function handleToolRequest(id, tool, args, sessionId) {
     try {
       await assertTabOwned(sid, args.tabId);
     } catch (e) {
-      sendResponse(id, { content: [{ type: "text", text: e.message }] });
+      sendResponse(id, { content: [{ type: "text", text: e.message }], isError: true });
       return;
     }
   }
+
+  if (args && typeof args.tabId === "number" && !SELF_CHECKED_TOOLS.has(tool)) await indicator.touch(args.tabId);
 
   const t0 = Date.now();
   const label = tool === "computer" ? `computer.${args && args.action}` : tool;
@@ -2652,7 +2752,7 @@ async function handleToolRequest(id, tool, args, sessionId) {
     if (tool !== "javascript_tool" && tool !== "debug_timings") {
       recordTiming({ t: t0, tool, tab: args?.tabId, ms: Date.now() - t0 });
     }
-    sendResponse(id, result);
+    sendResponse(id, finishResult(result, args));
   } catch (err) {
     dbg("tool", `${label} -> THREW`, { tab: args && args.tabId, ms: Date.now() - t0, err: String(err.message).slice(0, 160) });
     sendError(id, `${tool} failed: ${err.message}`);

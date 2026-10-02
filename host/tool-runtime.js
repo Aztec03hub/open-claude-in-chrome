@@ -299,11 +299,12 @@ export async function callTool(toolName, args) {
         ? await findWithModel(coerced, sendToExtension)
         : await sendToExtension(toolName, coerced);
     if (typeof result === "string") return textResult(result);
+    // Extension-side error results arrive already flagged (handleToolRequest).
     // gif_creator export returns the GIF bytes; keep them as a file here.
     if (result && result.content) return toolName === "gif_creator" ? saveGifBlocks(result) : result;
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
-    return textResult(`Error: ${err.message}`);
+    return { ...textResult(`Error: ${err.message}`), isError: true };
   }
 }
 

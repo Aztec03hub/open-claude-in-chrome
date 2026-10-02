@@ -101,8 +101,9 @@ export const TOOLS = [
         ),
       tabId: z
         .number()
+        .optional()
         .describe(
-          "Tab ID to navigate. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+          "Tab ID to navigate. Must be a tab in the current group. If omitted, the session's tab group is used (and created if it does not exist yet)."
         )
     }
   },
@@ -253,12 +254,18 @@ export const TOOLS = [
   {
     name: "get_page_text",
     description:
-      "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+      "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. Output is limited to 50000 characters by default; if it exceeds the limit it is truncated at a line boundary with a note giving the full size. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
     paramShape: {
       tabId: z
         .number()
         .describe(
           "Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+        ),
+      max_chars: z
+        .number()
+        .optional()
+        .describe(
+          "Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs."
         )
     }
   },
@@ -421,7 +428,7 @@ export const TOOLS = [
   {
     name: "read_page",
     description:
-      "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+      "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit it is truncated at a line boundary, with a note giving the full size - pass a larger max_chars, or use depth/ref_id to focus on part of the page. Filter \"interactive\" lists only interactive elements in or near the viewport (unless ref_id is given); \"all\" covers the whole page. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
     paramShape: {
       tabId: z
         .number()
@@ -626,7 +633,7 @@ export const TOOLS = [
   {
     name: "upload_image",
     description:
-      "Upload a previously captured screenshot (from the computer tool's screenshot action) to a file input. Identify the target with `ref` from read_page or find; the target must be an <input type=\"file\"> (especially useful for hidden inputs).",
+      "Upload a previously captured screenshot (from the computer tool's screenshot action) to a file input. Identify the target with either `ref` (an <input type=\"file\">, especially useful for hidden inputs) or `coordinate` (drag & drop onto the element at that point, e.g. Google Docs). Provide either ref or coordinate, not both.",
     paramShape: {
       imageId: z
         .string()
@@ -640,8 +647,17 @@ export const TOOLS = [
         ),
       ref: z
         .string()
+        .optional()
         .describe(
-          'Element reference ID of the file input from read_page or find tools (e.g., "ref_1", "ref_2").'
+          'Element reference ID of the file input from read_page or find tools (e.g., "ref_1", "ref_2"). Use this for file inputs (especially hidden ones). Provide either ref or coordinate, not both.'
+        ),
+      coordinate: z
+        .array(z.number())
+        .min(2)
+        .max(2)
+        .optional()
+        .describe(
+          "Coordinates [x, y] for drag & drop to a visible location, in the coordinate frame of the most recent screenshot (like computer clicks). Use this for drag & drop targets like Google Docs. Provide either ref or coordinate, not both."
         ),
       filename: z
         .string()
