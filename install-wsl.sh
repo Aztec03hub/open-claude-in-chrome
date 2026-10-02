@@ -60,13 +60,19 @@ echo "Extension id:   $EXT_ID"
 echo
 
 # 1. Copy extension + host to Windows (Windows node must never run from \\wsl$).
-run rm -rf "$DEST/extension" "$DEST/host"
+# Update IN PLACE, never delete the folders: Chrome keeps a native host
+# (Windows node.exe) running from host/, and Windows refuses to remove a folder
+# a process has open. An earlier `rm -rf` of both folders deleted extension/,
+# emptied host/, then failed on host/ itself, leaving the extension broken.
+# rsync --delete only removes stale FILES, and only inside these two folders.
 run mkdir -p "$DEST/extension" "$DEST/host"
 write_file "$DEST/.ocic-install" "open-claude-in-chrome install dir; uninstall-wsl.sh removes extension/ and host/ here"
-run cp -r "$SRC/extension/." "$DEST/extension/"
+run rsync -rt --delete "$SRC/extension/" "$DEST/extension/"
 # The native host is stdlib-only, so no node_modules are needed on the Windows side.
 # Copy native-host.js and every local module it imports (computed, not hand-kept).
 HOST_FILES="$(node "$SRC/host/local-deps.mjs" native-host.js)" || { echo "cannot resolve native host files" >&2; exit 1; }
+# Overwrite in place (files, not the folder; a stale extra .js is harmless,
+# a missing one is fatal).
 for f in $HOST_FILES package.json; do
   run mkdir -p "$(dirname "$DEST/host/$f")"
   run cp "$SRC/host/$f" "$DEST/host/$f"

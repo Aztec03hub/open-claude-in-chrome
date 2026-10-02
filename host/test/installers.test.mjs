@@ -26,6 +26,21 @@ test("M5: the installer records OCIC_WIN_USER for the MCP server and in config.j
   assert.match(r.stdout, /\.ocic-install/, "installer drops the marker");
 });
 
+test("install updates extension/ and host/ in place and never deletes them (live 2026-10-02: rm -rf failed on host/ held open by the running native host, after extension/ was already gone)", (t) => {
+  const winUser = [process.env.OCIC_WIN_USER, process.env.USER].find((u) => u && fs.existsSync(`/mnt/c/Users/${u}`));
+  if (!winUser) return t.skip("needs a WSL host with /mnt/c/Users/<user>");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "occ-inst-"));
+  const r = sh("install-wsl.sh", { HOME: home, OCIC_WIN_USER: winUser });
+  if (r.status !== 0 && /node\.exe|reg\.exe/.test(r.stdout + r.stderr)) return t.skip("no Windows node.exe / reg.exe here");
+  assert.equal(r.status, 0, r.stderr);
+  const cmds = r.stdout.split("\n").filter((l) => l.startsWith("DRY-RUN:"));
+  assert.ok(!cmds.some((l) => /\brm\b/.test(l)), `no rm in the install plan:\n${cmds.filter((l) => /\brm\b/.test(l)).join("\n")}`);
+  assert.ok(cmds.some((l) => /rsync -rt --delete .*\/extension\/ .*\/extension\//.test(l)), "extension/ is synced in place");
+  for (const f of ["native-host.js", "endpoint.js", "session-tracker.js", "native-limit.js"]) {
+    assert.ok(cmds.some((l) => new RegExp(`cp .*/host/${f.replace(".", "\\.")} `).test(l)), `host/${f} is copied`);
+  }
+});
+
 test("M5: the config.json writer keeps other keys and sets winUser", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "occ-cfg-"));
   const cfg = path.join(home, ".config", "open-claude-in-chrome", "config.json");
