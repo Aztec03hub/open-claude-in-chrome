@@ -3,6 +3,11 @@
 
 import * as humanize from "./humanize/index.js";
 import * as audit from "./audit/index.js";
+import { registerTools } from "./tools/register.js";
+import { buildKeyEvents } from "./tools/keys.js";
+import { runJavascript } from "./tools/js-exec.js";
+import { formatExceptionEntry } from "./tools/console.js";
+import { validateFiles, setFilesInPage } from "./tools/upload.js";
 
 // Prevent unhandled rejections from killing the service worker
 self.addEventListener("unhandledrejection", (event) => {
@@ -508,6 +513,14 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       url: params.stackTrace?.callFrames?.[0]?.url || "",
       timestamp: Date.now(),
     });
+    if (msgs.length > 1000) msgs.splice(0, msgs.length - 1000);
+    consoleMessages.set(tabId, msgs);
+  }
+
+  // Uncaught exceptions / unhandled rejections are not console calls.
+  if (method === "Runtime.exceptionThrown" && params.exceptionDetails) {
+    const msgs = consoleMessages.get(tabId) || [];
+    msgs.push(formatExceptionEntry(params));
     if (msgs.length > 1000) msgs.splice(0, msgs.length - 1000);
     consoleMessages.set(tabId, msgs);
   }
@@ -1595,23 +1608,16 @@ const toolHandlers = {
         const repeat = Math.min(args.repeat || 1, 100);
         // Parse space-separated key combos
         const keys = args.text.split(" ").filter(Boolean);
+        for (const keyStr of keys) {
+          if (!buildKeyEvents(keyStr)) {
+            return { content: [{ type: "text", text: `Unknown key "${keyStr}". Use a key name (Enter, Tab, Escape, ArrowDown, F5...), a single character, or a combo like ctrl+a / cmd+shift+z.` }] };
+          }
+        }
         for (let r = 0; r < repeat; r++) {
           for (const keyStr of keys) {
-            const { key, modifiers: keyMod } = parseKeyCombo(keyStr);
-            const resolvedKey = key.length === 1 ? key : key;
-            await cdp(tabId, "Input.dispatchKeyEvent", {
-              type: "keyDown",
-              key: resolvedKey,
-              code: resolvedKey.length === 1 ? `Key${resolvedKey.toUpperCase()}` : resolvedKey,
-              modifiers: keyMod,
-              windowsVirtualKeyCode: resolvedKey.charCodeAt ? resolvedKey.charCodeAt(0) : 0,
-            });
-            await cdp(tabId, "Input.dispatchKeyEvent", {
-              type: "keyUp",
-              key: resolvedKey,
-              code: resolvedKey.length === 1 ? `Key${resolvedKey.toUpperCase()}` : resolvedKey,
-              modifiers: keyMod,
-            });
+            const { down, up } = buildKeyEvents(keyStr);
+            await cdp(tabId, "Input.dispatchKeyEvent", down);
+            await cdp(tabId, "Input.dispatchKeyEvent", up);
             // Brave's debugger pipeline needs a settle window between key
             // events; Chrome acks instantly, so the sleep is pure latency there.
             if (await isBrave()) await sleep(30);
@@ -1689,10 +1695,13 @@ const toolHandlers = {
       case "scroll_to": {
         if (!coordinate && !args.ref) return { content: [{ type: "text", text: "coordinate or ref is required for scroll_to" }] };
         if (args.ref) {
-          await sendContentMessage(tabId, {
+          const sr = await sendContentMessage(tabId, {
             type: "scrollToRef",
             ref: args.ref,
           });
+          if (!sr?.result?.ok) {
+            return { content: [{ type: "text", text: `Could not scroll to ref "${args.ref}": element not found. The page may have changed — re-run read_page or find for a fresh ref.` }] };
+          }
         }
         // Scroll target element into view via JS
         if (coordinate) {
@@ -1860,6 +1869,8 @@ const toolHandlers = {
     const result = resp?.result;
 
     if (result?.error) return { content: [{ type: "text", text: `Error: ${result.error}` }] };
+    // Do not echo a secret back: content.js flags password / card fields.
+    if (result?.sensitive) return { content: [{ type: "text", text: `Set ${ref} to "[value redacted]". Result: ${JSON.stringify(result)}` }] };
     return { content: [{ type: "text", text: `Set ${ref} to "${value}". Result: ${JSON.stringify(result)}` }] };
   },
 
@@ -1871,10 +1882,19 @@ const toolHandlers = {
     await ensureAttached(tabId);
     try {
       const tEval = Date.now();
-      const result = await cdp(tabId, "Runtime.evaluate", {
-        expression: text,
-        returnByValue: true,
-        awaitPromise: true,
+      // Top-level await, `return`, a hard timeout and scrubbed output: see
+      // tools/js-exec.js. args.timeout is in seconds.
+      const { text: out } = await runJavascript({
+        code: text,
+        timeoutMs: args.timeout ? Number(args.timeout) * 1000 : undefined,
+        evaluate: (expression, replMode, timeout) =>
+          withTimeout(
+            chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+              expression, returnByValue: true, awaitPromise: true, replMode, timeout
+            }),
+            timeout + 5000,
+            "javascript_tool"
+          )
       });
       // preMs = group check + debugger attach; evalMs = the evaluate alone.
       // The split is the whole point: it separates "the renderer serviced the
@@ -1882,18 +1902,7 @@ const toolHandlers = {
       recordTiming({ t: tIn, tool: "javascript_tool", tab: tabId,
                      preMs: tEval - tIn, evalMs: Date.now() - tEval,
                      bytes: (text || "").length });
-
-      if (result.exceptionDetails) {
-        return {
-          content: [{ type: "text", text: `Error: ${result.exceptionDetails.text || JSON.stringify(result.exceptionDetails)}` }],
-        };
-      }
-
-      const val = result.result;
-      if (val.type === "undefined") return { content: [{ type: "text", text: "undefined" }] };
-      return {
-        content: [{ type: "text", text: val.value !== undefined ? JSON.stringify(val.value) : val.description || String(val) }],
-      };
+      return { content: [{ type: "text", text: out }] };
     } catch (e) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }] };
     }
@@ -2286,6 +2295,9 @@ const toolHandlers = {
   async file_upload(args) {
     const { tabId, paths, ref } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    // `files` (name/mimeType/base64, sent by the MCP server after it read them
+    // from ITS filesystem) takes precedence over browser-side `paths`.
+    if (args.files !== undefined) return uploadFilesFromBytes(tabId, ref, args.files);
     if (!Array.isArray(paths) || paths.length === 0 || !paths.every((p) => typeof p === "string" && p)) {
       return { content: [{ type: "text", text: "file_upload requires 'paths' — a non-empty array of absolute file paths that already exist on this machine." }] };
     }
@@ -2570,6 +2582,39 @@ const toolHandlers = {
   },
 };
 
+// file_upload with in-memory bytes: stamp the target input via the content
+// script (same marker the path branch uses), then build File objects in the page.
+async function uploadFilesFromBytes(tabId, ref, files) {
+  const v = validateFiles(files);
+  if (v.error) return { content: [{ type: "text", text: `file_upload: ${v.error}` }] };
+  if (!ref || typeof ref !== "string") {
+    return { content: [{ type: "text", text: "file_upload requires 'ref' — the element reference of an <input type=file> from read_page or find." }] };
+  }
+  const mark = await sendContentMessage(tabId, { type: "markElementForUpload", ref });
+  if (!mark || !mark.ok) {
+    return { content: [{ type: "text", text: `No element found for ref=${ref}. Re-run read_page/find to get a fresh ref.` }] };
+  }
+  try {
+    if (!mark.isFileInput) {
+      return { content: [{ type: "text", text: `Target ref=${ref} is a <${mark.tag}>, not a file input. Point at the <input type=file> element (read_page/find can locate hidden ones).` }] };
+    }
+    const res = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: setFilesInPage,
+      args: ["[data-ocic-upload-target]", v.files]
+    });
+    const r = res && res[0] && res[0].result;
+    if (!r || !r.ok) return { content: [{ type: "text", text: `file_upload failed: ${(r && r.error) || "no result from page"}` }] };
+    const names = v.files.map((f) => f.name).join(", ");
+    return { content: [{ type: "text", text: `Attached ${v.files.length === 1 ? names : `${v.files.length} files (${names})`} to the file input (ref=${ref}).` }] };
+  } finally {
+    await sendContentMessage(tabId, { type: "unmarkElementForUpload" }).catch(() => {});
+  }
+}
+
+registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore });
+
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
   // recording_ack arrives from the MCP server when Claude confirms receipt of
@@ -2620,7 +2665,8 @@ async function handleToolRequest(id, tool, args) {
   }
   try {
     const t0 = Date.now();
-    const result = await handler(args);
+    const clientId = (String(id).match(/^h(\d+)_/) || [])[1] ?? null;
+    const result = await handler(args, { sessionId: clientId });
     // Record the SHAPE of the reply, not the reply. Echoing the response text
     // here would make the stream a copy of what the caller already received,
     // which is worth nothing to them; what they cannot see is how long it took
