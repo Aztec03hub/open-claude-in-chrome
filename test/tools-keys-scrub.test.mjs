@@ -47,7 +47,7 @@ ok(resolveKey("Enter") !== resolveKey("Enter"), "resolveKey returns fresh copies
 console.log("== scrub ==");
 ok(scrubValue("a=1; b=2") === "[BLOCKED: Cookie/query string data]", "cookie string");
 ok(scrubValue("x=1&y=2") === "[BLOCKED: Cookie/query string data]", "query string");
-ok(scrubValue("aaa.bbb.ccc") === "[BLOCKED: JWT token]", "JWT");
+ok(scrubValue("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk") === "[BLOCKED: JWT token]" && scrubValue("aaa.bbb.ccc") === "aaa.bbb.ccc", "JWT (real shape only)");
 const sc = scrubValue({ user: "bob", password: "hunter2", nested: { apiToken: "t", Authorization: "Bearer x", session_id: "s", cookie: "c", ok: 1 }, author: "keep" });
 ok(sc.user === "bob" && sc.password === "[BLOCKED: Sensitive key]", "password key blocked, others kept");
 ok(sc.nested.apiToken === "[BLOCKED: Sensitive key]" && sc.nested.Authorization === "[BLOCKED: Sensitive key]" && sc.nested.session_id === "[BLOCKED: Sensitive key]" && sc.nested.cookie === "[BLOCKED: Sensitive key]", "token/authorization/session/cookie keys blocked (nested, case-insensitive)");
@@ -87,6 +87,19 @@ ok(formatEvalResult({ result: { type: "object", subtype: "node", description: "d
 const big = formatEvalResult({ result: { type: "string", value: "y".repeat(1200) } });
 ok(big.text.length === 1000 + "[TRUNCATED]".length, "single string capped at 1000 chars by scrub");
 ok(formatEvalResult({ result: { type: "object", value: Object.fromEntries(Array.from({ length: 99 }, (_, i) => ["k" + i, "v".repeat(900)])) } }).text.length <= MAX_OUTPUT + 60, "overall output capped near 50KB");
+
+console.log("== M4: scrubbing blocks secrets, not ordinary values ==");
+const fe = (value) => formatEvalResult({ result: { type: "string", value } }).text;
+ok(fe("www.example.com") === "www.example.com" && fe("1.2.3") === "1.2.3" && fe("example.co.uk") === "example.co.uk", "hostnames / versions are not JWTs");
+ok(fe("https://x.test/p?a=1&b=2;c=3") === "https://x.test/p?a=1&b=2;c=3", "a URL with a query string passes");
+ok(fe('<div class="a" style="color:red;top:0">x</div>') === '<div class="a" style="color:red;top:0">x</div>', "HTML with = and ; passes");
+const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+ok(fe(jwt) === "[BLOCKED: JWT token]", "a real JWT is still blocked");
+ok(fe("sid=abc123") === "[BLOCKED: Cookie/query string data]" && fe("a=1; b=2") === "[BLOCKED: Cookie/query string data]", "document.cookie with ONE cookie is blocked (was leaked)");
+const thrown = formatEvalResult({ exceptionDetails: { exception: { className: "Error", description: "Error: sid=abc123\n    at <anonymous>:1:7" } } });
+ok(thrown.isError && !thrown.text.includes("abc123") && /Error: .*BLOCKED: Cookie/.test(thrown.text) && /at <anonymous>/.test(thrown.text), "throw new Error(document.cookie) does not leak the cookie; stack kept");
+ok(formatEvalResult({ exceptionDetails: { exception: { description: `Error: ${jwt}` } } }).text.includes("BLOCKED: JWT"), "JWT in an exception message is blocked");
+ok(formatEvalResult({ exceptionDetails: { exception: { className: "TypeError", description: "TypeError: Cannot read properties of null (reading 'x')\n    at f" } } }).text === "Error: TypeError: Cannot read properties of null (reading 'x')\n    at f", "ordinary exception text unchanged");
 
 console.log("== console: uncaught exceptions ==");
 const ex = formatExceptionEntry({ exceptionDetails: { text: "Uncaught", url: "https://x/a.js", exception: { description: "TypeError: boom\n    at f (https://x/a.js:3:9)" } } }, 7);

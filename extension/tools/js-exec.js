@@ -9,7 +9,7 @@
 //  - Runtime.evaluate's own `timeout` terminates runaway scripts (a plain
 //    Promise.race would return while the script kept running).
 
-import { scrubValue } from "./scrub.js";
+import { scrubValue, scrubMessage } from "./scrub.js";
 
 export const DEFAULT_TIMEOUT_MS = 30000;
 export const MAX_TIMEOUT_MS = 55000; // the MCP request itself dies at 60 s
@@ -37,7 +37,7 @@ export function formatEvalResult(res, timeoutMs = DEFAULT_TIMEOUT_MS) {
     const desc = (ex && (ex.description || ex.value)) || res.exceptionDetails.text || "Unknown error";
     const msg = /execution (was )?terminated/i.test(String(desc))
       ? `Execution timeout: Code exceeded ${timeoutMs / 1000}-second limit`
-      : String(desc);
+      : scrubMessage(desc);
     return { text: `Error: ${msg}`, isError: true };
   }
   const r = res.result;
