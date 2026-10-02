@@ -275,6 +275,12 @@ export const TOOLS = [
       tabId: z
         .number()
         .describe("Tab ID to identify which tab group this operation applies to"),
+      coordinate: z
+        .array(z.number())
+        .optional()
+        .describe(
+          "Coordinates [x, y] for drag & drop upload of the GIF onto a page element, in the coordinate frame of the most recent screenshot. For 'export' only; omit it and 'download' to have the GIF saved on the machine running the MCP server (the result gives the path)."
+        ),
       download: z
         .boolean()
         .optional()
@@ -325,7 +331,7 @@ export const TOOLS = [
   {
     name: "javascript_tool",
     description:
-      "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+      "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Top-level await and `return` are supported; the result of the last expression (or the returned value) comes back, with cookie strings, JWTs and values of keys like password/token/secret/authorization/session/cookie redacted. Execution is aborted after the timeout (default 30 s). If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
     paramShape: {
       action: z
         .literal("javascript_exec")
@@ -333,8 +339,12 @@ export const TOOLS = [
       text: z
         .string()
         .describe(
-          "The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements - just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). You can access and modify the DOM, call page functions, and interact with page variables."
+          "The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically (e.g. 'window.myData.value'); 'return' and top-level 'await' also work. You can access and modify the DOM, call page functions, and interact with page variables."
         ),
+      timeout: z
+        .number()
+        .optional()
+        .describe("Execution timeout in seconds (default 30, max 55). The script is terminated when it expires."),
       tabId: z
         .number()
         .describe(
@@ -489,7 +499,23 @@ export const TOOLS = [
         .optional()
         .describe(
           "The command name of the shortcut to execute (e.g., 'debug', 'summarize'). Do not include the leading slash."
-        )
+        ),
+      arguments: z
+        .string()
+        .optional()
+        .describe("Optional text substituted for $ARGS in the shortcut's prompt.")
+    }
+  },
+  {
+    name: "shortcuts_save",
+    description:
+      "Create, update or delete a saved shortcut (a named, reusable prompt). Pass `command` (e.g. 'summarize') and `prompt` to create or update; pass `command` or `id` without `prompt` to delete. In the prompt, $ARGS is replaced by the `arguments` given to shortcuts_execute. Not part of the official tool set: this extension has no settings UI, so this is how shortcuts are created.",
+    paramShape: {
+      command: z.string().optional().describe("Command name without the leading slash."),
+      id: z.string().optional().describe("Existing shortcut id (to update or delete by id)."),
+      prompt: z.string().optional().describe("The instructions to run. Omit to delete the shortcut."),
+      description: z.string().optional().describe("Short description shown by shortcuts_list."),
+      isWorkflow: z.boolean().optional().describe("Mark as a workflow (informational).")
     }
   },
   {
@@ -640,12 +666,25 @@ export const TOOLS = [
   {
     name: "file_upload",
     description:
-      "Upload one or more local files (by absolute path) to a file input element on the page. Use read_page or find to locate the <input type=\"file\">, then pass its ref — do not click file inputs, which opens a native picker you cannot see. Each file must already exist on this machine (the same machine as the browser); the real path is passed straight to the browser, no staging. Keep the combined size of all files in a single call under ~10 MB.",
+      "Upload one or more local files (by absolute path) to a file input element on the page. Use read_page or find to locate the <input type=\"file\">, then pass its ref — do not click file inputs, which opens a native picker you cannot see. Each file must exist on the machine running Claude Code. When the browser can see that filesystem the path is passed straight to it; otherwise (e.g. Claude Code in WSL, Chrome on Windows) the MCP server reads the files and sends their contents (50 MB total cap). Keep the combined size of all files in a single call under ~10 MB where possible.",
     paramShape: {
       paths: z
         .array(z.string())
+        .optional()
         .describe(
           "Absolute paths to the files to upload (e.g., ['/home/user/report.pdf']). Each file must already exist on this machine."
+        ),
+      files: z
+        .array(
+          z.object({
+            name: z.string().describe("File name as the page will see it."),
+            mimeType: z.string().optional().describe("MIME type (default application/octet-stream)."),
+            base64: z.string().describe("File contents, base64-encoded.")
+          })
+        )
+        .optional()
+        .describe(
+          "File contents to upload, instead of `paths`. Populated by the MCP server from `paths` when the browser cannot see the caller's filesystem (e.g. Claude Code in WSL, Chrome on Windows)."
         ),
       ref: z
         .string()
@@ -656,6 +695,24 @@ export const TOOLS = [
         .number()
         .describe(
           "Tab ID where the file input is located. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+        )
+    }
+  },
+  {
+    name: "browser_batch",
+    description:
+      "Execute a sequence of browser tool calls in ONE round trip. Each item is {name, input} where input is exactly what you'd pass to that tool standalone. Actions execute SEQUENTIALLY (not in parallel) and stop on the first error, reporting how many completed. Use this whenever you can predict two or more steps ahead, e.g. navigate, click a field, type, press Return, screenshot. Screenshots and other images are returned interleaved with the text outputs, in order; coordinates you write in THIS batch refer to the screenshot taken BEFORE this call. tabs_context_mcp and tabs_create_mcp inside a batch need no tabId. browser_batch cannot be nested.",
+    paramShape: {
+      actions: z
+        .array(
+          z.object({
+            name: z.string().describe("Tool name (e.g. computer, navigate, find, tabs_create_mcp). browser_batch cannot be nested."),
+            input: z.record(z.any()).describe("That tool's input, same shape you'd pass when calling it directly.")
+          })
+        )
+        .min(1)
+        .describe(
+          'List of tool calls to execute sequentially. Example: [{"name":"computer","input":{"action":"left_click","coordinate":[100,200],"tabId":123}},{"name":"computer","input":{"action":"type","text":"hello","tabId":123}},{"name":"navigate","input":{"url":"https://example.com","tabId":123}}]'
         )
     }
   }
