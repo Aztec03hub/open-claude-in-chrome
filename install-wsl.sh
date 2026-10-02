@@ -65,7 +65,10 @@ run mkdir -p "$DEST/extension" "$DEST/host"
 write_file "$DEST/.ocic-install" "open-claude-in-chrome install dir; uninstall-wsl.sh removes extension/ and host/ here"
 run cp -r "$SRC/extension/." "$DEST/extension/"
 # The native host is stdlib-only, so no node_modules are needed on the Windows side.
-for f in endpoint.js native-host.js parent-watch.js package.json; do
+# Copy native-host.js and every local module it imports (computed, not hand-kept).
+HOST_FILES="$(node "$SRC/host/local-deps.mjs" native-host.js)" || { echo "cannot resolve native host files" >&2; exit 1; }
+for f in $HOST_FILES package.json; do
+  run mkdir -p "$(dirname "$DEST/host/$f")"
   run cp "$SRC/host/$f" "$DEST/host/$f"
 done
 
