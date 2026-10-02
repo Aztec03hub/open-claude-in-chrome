@@ -26,7 +26,8 @@ import { filesFromPaths } from "./file-upload.js";
 
 // Under WSL the host's pipe is a Windows named pipe, reached through a Windows
 // node.exe relay child (wsl-transport.js).
-const WSL = isWsl();
+// A unix-path OCIC_PIPE is an explicit native override (test harnesses): no relay.
+const WSL = isWsl() && !(process.env.OCIC_PIPE && !process.env.OCIC_PIPE.startsWith("\\\\.\\pipe\\"));
 const PIPE_PATH = WSL ? windowsPipePath() : getPipePath();
 
 // One id per MCP server process. The extension scopes the tabs a session owns
