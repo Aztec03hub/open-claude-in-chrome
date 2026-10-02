@@ -46,25 +46,18 @@ let primedWith = null;
 const human = (speed, seed) => { primedWith = { speed, seed }; humanSessionSeed = (typeof seed === "number" ? seed : null); return humanSession; };
 
 const src = [
-  ...["tabs_create_mcp","set_tab_focus","get_config","set_config"].map(
+  ...["set_tab_focus","get_config","set_config"].map(
     (m) => `const H_${m} = { ${extractMethod(m)} };`),
   extractFunction("effectiveConfig"),
   extractFunction("writeConfig")
 ].join("\n\n");
 const mk = new Function("chrome","tabGroupId","tabGroupTabs","isInGroup","ensureTabGroup","formatTabContext",
   "CONFIG_KEY","TAB_CONFIG_KEY","CONFIG_SCHEMA","configState","configHydrated","humanSession","humanSessionSeed","human",
-  src + "; return { H_tabs_create_mcp, H_set_tab_focus, H_get_config, H_set_config, effectiveConfig, writeConfig };");
+  src + "; return { H_set_tab_focus, H_get_config, H_set_config, effectiveConfig, writeConfig };");
 const H = mk(globalThis.chrome, tabGroupId, tabGroupTabs, isInGroup, ensureTabGroup, formatTabContext,
   CONFIG_KEY, TAB_CONFIG_KEY, CONFIG_SCHEMA, configState, configHydrated, humanSession, humanSessionSeed, human);
 
-console.log("== #28: creating a tab must not select it or steal focus ==");
-api.length=0;
-await H.H_tabs_create_mcp.tabs_create_mcp({});
-const create = api.find(c=>c.name==="tabs.create");
-ok(create && create.arg.active===false, `tabs.create called with active:false (got ${JSON.stringify(create&&create.arg)})`);
-ok(create && create.arg.windowId===7, "new tab created in the MCP group's OWN window, not the operator's focused window");
-ok(!api.some(c=>c.name==="windows.update"), "no windows.update — never raises a window");
-ok(!api.some(c=>c.name==="tabs.update" && c.arg.active===true), "no tabs.update({active:true}) — never selects the new tab");
+// #28 (create tab: never selected, own window) moved to sessions.test.mjs
 
 console.log("== #35: set_tab_focus selects the tab ==");
 api.length=0;
