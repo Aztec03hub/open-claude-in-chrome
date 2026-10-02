@@ -38,3 +38,29 @@ export function setFilesInPage(selector, files) {
   el.dispatchEvent(new Event("change", { bubbles: true }));
   return { ok: true, count: el.files.length };
 }
+
+/** Mime type from the leading base64 bytes (screenshots are JPEG or PNG). */
+export function mimeFromBase64(b64) {
+  const head = String(b64 || "").replace(/^data:[^,]*,/, "");
+  if (head.startsWith("iVBOR")) return "image/png";
+  if (head.startsWith("R0lGOD")) return "image/gif";
+  return "image/jpeg";
+}
+
+/**
+ * Runs in the page (self-contained). Drop a file onto the element at (x, y) as a
+ * dragenter/dragover/drop sequence, like the official upload_image `coordinate`.
+ */
+export function dropFileInPage(base64, filename, mimeType, x, y) {
+  const bin = atob(String(base64).replace(/^data:[^,]*,/, ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const dt = new DataTransfer();
+  dt.items.add(new File([bytes], filename, { type: mimeType, lastModified: Date.now() }));
+  const el = document.elementFromPoint(x, y);
+  if (!el) return { ok: false, error: `No element found at coordinates (${x}, ${y})` };
+  for (const type of ["dragenter", "dragover", "drop"]) {
+    el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt, clientX: x, clientY: y }));
+  }
+  return { ok: true, tag: el.tagName.toLowerCase(), kb: Math.round(bytes.length / 1024) };
+}

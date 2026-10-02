@@ -8,7 +8,7 @@ const TABLESS = new Set(["tabs_context_mcp", "tabs_create_mcp"]);
 // Handlers report most failures as plain text, not by throwing, so a batch has
 // to recognise them or it would plough on after a failed step.
 const ERROR_TEXT =
-  /^(Error\b|Failed\b|Could not\b|Unknown\b|Invalid\b|No element found\b|None of the requested\b|Tab \d+ is not in\b)|\bis required\b|\brequires '/;
+  /^(Error\b|Failed\b|Could not\b|Unknown\b|Invalid\b|No element found\b|None of the requested\b|Tab \d+ is not in\b|[a-z_]+ is required\b|[a-z_]+ requires ')/;
 
 export function looksLikeError(result) {
   if (!result || typeof result !== "object") return false;
