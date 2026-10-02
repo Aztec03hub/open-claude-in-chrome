@@ -20,6 +20,8 @@ import net from "node:net";
 
 import { getPipePath } from "./endpoint.js";
 import { noteActivity } from "./parent-watch.js";
+import { findWithModel } from "./find-model.js";
+import { saveGifBlocks } from "./gif-save.js";
 
 const PIPE_PATH = getPipePath();
 
@@ -261,9 +263,18 @@ export async function callTool(toolName, args) {
   noteActivity();
   try {
     const coerced = coerceArgs(args ?? {});
-    const result = await sendToExtension(toolName, coerced);
+    // browser_batch carries nested tool inputs; coerce each the same way.
+    if (toolName === "browser_batch" && Array.isArray(coerced.actions)) {
+      for (const a of coerced.actions) if (a && typeof a.input === "object") coerceArgs(a.input);
+    }
+    // `find` is model-backed: the model call runs here (WSL side), not in the browser.
+    const result =
+      toolName === "find" && !process.env.OCIC_FIND_SUBSTRING
+        ? await findWithModel(coerced, sendToExtension)
+        : await sendToExtension(toolName, coerced);
     if (typeof result === "string") return textResult(result);
-    if (result && result.content) return result;
+    // gif_creator export returns the GIF bytes; keep them as a file here.
+    if (result && result.content) return toolName === "gif_creator" ? saveGifBlocks(result) : result;
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
     return textResult(`Error: ${err.message}`);
