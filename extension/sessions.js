@@ -34,12 +34,19 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     return run;
   }
 
+  // storage.LOCAL, not storage.session: Chrome clears storage.session when the
+  // extension reloads or updates (and on browser restart), which orphaned every
+  // live session's group and created tabs, so nothing ever cleaned them up
+  // (live test 2026-10-02). load() reconciles the map against live groups, so
+  // stale entries (closed groups, ids from a previous browser run) drop out.
+  const store = () => chrome.storage.local;
+
   async function persist() {
     const out = {};
     for (const [sid, s] of sessions) {
       out[sid] = { index: s.index, groupIds: s.groupIds, created: [...s.created], attached: [...s.attached], lastSeen: s.lastSeen, restore: Object.fromEntries(s.restore) };
     }
-    try { await chrome.storage.session.set({ [STORAGE_KEY]: out }); } catch (e) { dbg("sessions", "persist failed", { err: String(e && e.message).slice(0, 120) }); }
+    try { await store().set({ [STORAGE_KEY]: out }); } catch (e) { dbg("sessions", "persist failed", { err: String(e && e.message).slice(0, 120) }); }
   }
 
   function get(sid, create = true) {
@@ -82,7 +89,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     if (!loaded) {
       loaded = (async () => {
         let saved = {};
-        try { saved = (await chrome.storage.session.get(STORAGE_KEY))[STORAGE_KEY] || {}; } catch {}
+        try { saved = (await store().get(STORAGE_KEY))[STORAGE_KEY] || {}; } catch {}
         for (const [sid, r] of Object.entries(saved)) {
           sessions.set(sid, {
             index: r.index, groupIds: r.groupIds || [], created: new Set(r.created || []),

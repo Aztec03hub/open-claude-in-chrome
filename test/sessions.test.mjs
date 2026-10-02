@@ -4,7 +4,7 @@ let fail = 0; const ok = (c, m) => { console.log((c ? "  PASS " : "  FAIL ") + m
 const rejects = async (p) => { try { await p; return null; } catch (e) { return e.message; } };
 
 function fakeChrome(tabs0 = []) {
-  const st = { tabs: tabs0.map((t) => ({ groupId: -1, active: false, ...t })), groups: {}, nextTab: 500, nextGroup: 900, nextWin: 50, store: {}, calls: [], focusedWindow: 1 };
+  const st = { tabs: tabs0.map((t) => ({ groupId: -1, active: false, ...t })), groups: {}, nextTab: 500, nextGroup: 900, nextWin: 50, store: {}, sessionStore: {}, calls: [], focusedWindow: 1 };
   const rec = (n, a) => st.calls.push({ n, a });
   const chrome = {
     tabs: {
@@ -30,7 +30,12 @@ function fakeChrome(tabs0 = []) {
       update: async (gid, o) => { rec("tabGroups.update", { gid, ...o }); Object.assign(st.groups[gid], o); }
     },
     windows: { create: async (o) => { rec("windows.create", o); const w = st.nextWin++; const t = { id: st.nextTab++, windowId: w, active: true, groupId: -1 }; st.tabs.push(t); return { id: w, tabs: [{ ...t }] }; } },
-    storage: { session: { get: async () => ({ ...st.store }), set: async (v) => Object.assign(st.store, v) } }
+    // Two separate areas, like Chrome: an extension reload clears `session`
+    // but keeps `local` (see reloadExtension below).
+    storage: {
+      local: { get: async () => ({ ...st.store }), set: async (v) => Object.assign(st.store, v) },
+      session: { get: async () => ({ ...st.sessionStore }), set: async (v) => Object.assign(st.sessionStore, v) }
+    }
   };
   return { chrome, st };
 }
@@ -165,7 +170,7 @@ console.log("== persistence + reconcile ==");
   const a = await S.createTab("A"); await S.attach("A", { tabId: 1 });
   const b = await S.createTab("B");
   const S2 = createSessions(chrome); // service worker restart: fresh memory, same storage
-  ok((await S2.ownedTabs("A")).map((t) => t.id).sort().join() === [1, a.tab.id].sort().join(), "map restored from storage.session");
+  ok((await S2.ownedTabs("A")).map((t) => t.id).sort().join() === [1, a.tab.id].sort().join(), "map restored from storage");
   ok(S2.sessions.get("A").attached.has(1) && S2.sessions.get("A").created.has(a.tab.id), "created/attached tracking restored");
   st.tabs = st.tabs.filter((t) => t.id !== b.tab.id); // B's tab vanished while the worker slept
   const S3 = createSessions(chrome);
@@ -254,11 +259,27 @@ console.log("== M7: groups that end are reported (so GIF frames are freed) ==");
   ok(gone.includes(b.groupId), "closing a group's last tab reports the group");
 }
 
+console.log("== an extension reload does not orphan a session (live 2026-10-02) ==");
+{
+  // Chrome clears storage.session on extension reload/update; storage.local survives.
+  const { chrome, st, S } = mk([{ id: 1, windowId: 7 }]);
+  const a = await S.createTab("old");
+  await S.attach("old", { tabId: 1 });
+  st.sessionStore = {}; // the reload
+  const S2 = createSessions(chrome); // the reloaded extension
+  ok((await S2.ownedTabs("old")).length === 2, "after a reload the old session's group is still known");
+  const r = await S2.endSession("old"); // host's late session_end for the dead client
+  ok(r.closed.includes(a.tab.id) && !st.tabs.some((t) => t.id === a.tab.id), "its created tab is closed");
+  ok(r.ungrouped.includes(1) && st.tabs.find((t) => t.id === 1).groupId === -1, "its attached tab is handed back, still open");
+  const fresh = await S2.createTab("new");
+  ok(st.groups[fresh.groupId].title === "Claude", "a new session reuses the freed index, so no two live groups share a title");
+}
+
 console.log("== M7: persist() failures are logged, not swallowed ==");
 {
   const logs = [];
   const { chrome, S } = mk([], { dbg: (k, m) => logs.push(`${k}:${m}`) });
-  chrome.storage.session.set = async () => { throw new Error("QUOTA_BYTES quota exceeded"); };
+  chrome.storage.local.set = async () => { throw new Error("QUOTA_BYTES quota exceeded"); };
   await S.createTab("A");
   ok(logs.some((l) => /persist failed/.test(l)), "a full session store shows up in the debug log");
 }
