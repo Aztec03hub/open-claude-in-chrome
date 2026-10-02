@@ -8,7 +8,11 @@
 #   (allowed_origins = the stable extension id from the manifest "key")
 # - registers the host under HKCU for Chrome/Edge/Brave (name
 #   com.anthropic.open_claude_in_chrome; the official extension's keys are never touched)
-# - registers the MCP server in Claude Code at user scope (remove, then add)
+# - registers the MCP server in Claude Code at user scope (remove, then add), and
+#   records the Windows account name (config.json + the server's env) so the MCP
+#   server, which runs as the WSL user, finds the same pipe and node.exe
+# - drops a .ocic-install marker in the install dir; uninstall-wsl.sh only deletes
+#   a dir that carries it
 #
 # Env: OCIC_WIN_USER (Windows account, default $USER), OCIC_WIN_DIR (WSL path of the
 # install dir), OCIC_WIN_NODE (WSL path of a Windows node.exe).
@@ -58,6 +62,7 @@ echo
 # 1. Copy extension + host to Windows (Windows node must never run from \\wsl$).
 run rm -rf "$DEST/extension" "$DEST/host"
 run mkdir -p "$DEST/extension" "$DEST/host"
+write_file "$DEST/.ocic-install" "open-claude-in-chrome install dir; uninstall-wsl.sh removes extension/ and host/ here"
 run cp -r "$SRC/extension/." "$DEST/extension/"
 # The native host is stdlib-only, so no node_modules are needed on the Windows side.
 for f in endpoint.js native-host.js parent-watch.js package.json; do
@@ -95,9 +100,18 @@ if [ "$DRY" = 1 ] || command -v claude >/dev/null; then
     claude mcp remove -s user open-claude-in-chrome >/dev/null 2>&1 || true
   fi
   [ -d "$SRC/host/node_modules" ] || run npm --prefix "$SRC/host" install --omit=dev
-  run claude mcp add -s user open-claude-in-chrome -- node "$SRC/host/mcp-server.js"
+  run claude mcp add -s user open-claude-in-chrome -e "OCIC_WIN_USER=$WIN_USER" -- node "$SRC/host/mcp-server.js"
 else
-  echo "claude CLI not found; register manually: claude mcp add -s user open-claude-in-chrome -- node $SRC/host/mcp-server.js"
+  echo "claude CLI not found; register manually: claude mcp add -s user open-claude-in-chrome -e OCIC_WIN_USER=$WIN_USER -- node $SRC/host/mcp-server.js"
+fi
+
+# 5. Remember the Windows account name for the WSL side (read by windowsUser() in
+# host/wsl-transport.js), in case the MCP server is started without the env var.
+CFG="$HOME/.config/open-claude-in-chrome/config.json"
+if [ "$DRY" = 1 ]; then
+  printf 'DRY-RUN: set winUser=%s in %s\n' "$WIN_USER" "$CFG"
+else
+  node -e 'const fs=require("fs"),path=require("path"),p=process.argv[1];let c={};try{c=JSON.parse(fs.readFileSync(p,"utf8"))}catch{}c.winUser=process.argv[2];fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n")' "$CFG" "$WIN_USER"
 fi
 
 cat <<EOF
