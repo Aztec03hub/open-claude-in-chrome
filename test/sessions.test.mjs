@@ -233,6 +233,15 @@ console.log("== M8: attach remembers the user's group + pin; detach and session 
   ok(m4.st.tabs.find((t) => t.id === 3).pinned === true, "restore info survives a worker restart");
 }
 
+console.log("== L5: createdTab never picks an attached (user) tab ==");
+{
+  const { S, st } = mk([{ id: 1, windowId: 7, title: "Gmail" }]);
+  await S.attach("A", { tabId: 1 });
+  const t = await S.createdTab("A");
+  ok(t.id !== 1 && st.tabs.length === 2, "attached Gmail tab skipped, a fresh tab created");
+  ok((await S.createdTab("A")).id === t.id && st.tabs.length === 2, "second call reuses the created tab");
+}
+
 console.log("== listAll ==");
 {
   const { S } = mk([{ id: 1, windowId: 7, title: "u", url: "x" }]);

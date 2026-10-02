@@ -5,16 +5,11 @@
 
 const TABLESS = new Set(["tabs_context_mcp", "tabs_create_mcp"]);
 
-// Handlers report most failures as plain text, not by throwing, so a batch has
-// to recognise them or it would plough on after a failed step.
-const ERROR_TEXT =
-  /^(Error\b|Failed\b|Could not\b|Unknown\b|Invalid\b|No element found\b|None of the requested\b|Tab \d+ is not in\b|[a-z_]+ is required\b|[a-z_]+ requires ')/;
-
+// Handlers flag failures explicitly (result.isError, see result.js); the
+// wording of a result is never inspected, so page text like "Invalid email"
+// cannot stop a batch.
 export function looksLikeError(result) {
-  if (!result || typeof result !== "object") return false;
-  if (result.isError) return true;
-  const first = Array.isArray(result.content) ? result.content.find((c) => c && c.type === "text") : null;
-  return !!first && ERROR_TEXT.test(String(first.text || "").trim());
+  return !!(result && typeof result === "object" && result.isError);
 }
 
 export function actionLabel(a) {
@@ -48,15 +43,28 @@ export function validateBatch(args, handlers) {
 
 /**
  * @param args      { actions: [{name, input}] }
- * @param opts      { handlers, sessionId, assertTabOwned, selfChecked }
+ * @param opts      { handlers, sessionId, assertTabOwned, selfChecked, finish, inFlight }
  *   assertTabOwned(sessionId, tabId) throws unless the session owns the tab;
  *   selfChecked names tools that do their own ownership checks (tabs_attach_mcp
  *   targets a tab the session does not own yet).
+ *   finish(result, input) is the dispatcher's per-call post-processing (dialog
+ *   notes); inFlight {begin,end}(tabId) marks the batch's tabs as being driven
+ *   for its whole duration (see inflight.js).
  */
-export async function runBatch(args, { handlers, sessionId, assertTabOwned, selfChecked = new Set() }) {
+export async function runBatch(args, { handlers, sessionId, assertTabOwned, selfChecked = new Set(), finish = (r) => r, inFlight = null }) {
   const bad = validateBatch(args, handlers);
   if (bad) return { content: [{ type: "text", text: `browser_batch: ${bad}` }], isError: true };
 
+  const tabIds = [...new Set(args.actions.map((a) => a.input.tabId).filter((t) => typeof t === "number"))];
+  tabIds.forEach((t) => inFlight && inFlight.begin(t));
+  try {
+    return await runActions(args, { handlers, sessionId, assertTabOwned, selfChecked, finish });
+  } finally {
+    tabIds.forEach((t) => inFlight && inFlight.end(t));
+  }
+}
+
+async function runActions(args, { handlers, sessionId, assertTabOwned, selfChecked, finish }) {
   const actions = args.actions;
   const total = actions.length;
   const out = [];
@@ -74,7 +82,7 @@ export async function runBatch(args, { handlers, sessionId, assertTabOwned, self
         await assertTabOwned(sessionId, input.tabId);
       }
       // Same session as the batch itself, so tab tools act on the caller's group.
-      result = await handlers[a.name](input, sessionId);
+      result = finish(await handlers[a.name](input, sessionId), input);
     } catch (e) {
       return failure(out, i, total, label, e && e.message ? e.message : String(e), i);
     }

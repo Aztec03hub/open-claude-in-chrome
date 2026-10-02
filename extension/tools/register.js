@@ -1,15 +1,16 @@
 // One hook-in for background.js: builds the handlers for the tools implemented
 // in this directory and wraps computer/navigate so a running GIF recording
 // captures a frame after each action. background.js calls
-//   registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore, assertTabOwned, selfChecked })
+//   registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore, assertTabOwned, selfChecked, finish, inFlight })
 // once, after toolHandlers is defined. Handlers are called as (args, sessionId).
 
 import { runBatch, looksLikeError } from "./batch.js";
+import { err } from "./result.js";
 import { createGifTool, toBase64 } from "./gif.js";
 import { renderGif, dropGifInPage } from "./gif-render.js";
 import { createShortcuts } from "./shortcuts.js";
 
-export function registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore, assertTabOwned, selfChecked }) {
+export function registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore, assertTabOwned, selfChecked, finish, inFlight }) {
   const gif = createGifTool({
     storage: chrome.storage.session,
     getTab: (id) => chrome.tabs.get(id),
@@ -53,7 +54,7 @@ export function registerTools({ toolHandlers, isInGroup, takeScreenshot, screens
 
   const guarded = (fn) => async (args, sid) => {
     if (args && typeof args.tabId === "number" && !(await isInGroup(args.tabId))) {
-      return { content: [{ type: "text", text: `Tab ${args.tabId} is not in the MCP group.` }] };
+      return err(`Tab ${args.tabId} is not in the MCP group.`);
     }
     return fn(args, sid);
   };
@@ -63,6 +64,6 @@ export function registerTools({ toolHandlers, isInGroup, takeScreenshot, screens
     shortcuts_list: guarded(() => shortcuts.shortcuts_list()),
     shortcuts_execute: guarded((args) => shortcuts.shortcuts_execute(args)),
     shortcuts_save: (args) => shortcuts.shortcuts_save(args),
-    browser_batch: (args, sid) => runBatch(args, { handlers: toolHandlers, sessionId: sid, assertTabOwned, selfChecked }),
+    browser_batch: (args, sid) => runBatch(args, { handlers: toolHandlers, sessionId: sid, assertTabOwned, selfChecked, finish, inFlight }),
   });
 }

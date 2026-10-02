@@ -3,13 +3,16 @@
 // content.js is run for real inside a fake window/document.
 import fs from "node:fs";
 import path from "node:path";
-import { createDialogLog, handleDialogOpening, withDialogNotes, shouldAccept, describeDialog } from "../extension/tools/dialogs.js";
+import { createInFlight } from "../extension/tools/inflight.js";
+import { createDialogLog, handleDialogOpening, maybeHandleDialog, withDialogNotes, shouldAccept, describeDialog } from "../extension/tools/dialogs.js";
 import { failedRecord, formatNetworkLine, isCrossDomain } from "../extension/tools/network.js";
 import { dropFileInPage, mimeFromBase64 } from "../extension/tools/upload.js";
 import { createIndicator, paintIndicator, INDICATOR_ID } from "../extension/tools/indicator.js";
 import { looksLikeError } from "../extension/tools/batch.js";
+import { err } from "../extension/tools/result.js";
 import { extractFunction, extractMethod, compile, ROOT } from "./_extract.mjs";
 
+const realTimers = { setTimeout, clearTimeout };
 let fail = 0;
 const ok = (c, m) => { console.log((c ? "  PASS " : "  FAIL ") + m); if (!c) fail++; };
 
@@ -116,6 +119,39 @@ ok(res.content.length === 2 && res.content[1].text === "[JS dialog handled: a; b
 ok(withDialogNotes({ content: [] }, []).content.length === 0 && withDialogNotes(null, ["a"]) === null, "no-ops");
 ok(describeDialog({ type: "alert", message: "m" }, true) === 'alert "m" was accepted automatically', "describe");
 
+console.log("== M1: only dialogs during an agent call (+2 s grace) are auto-answered ==");
+{
+  let clock = 1000;
+  const inFlight = createInFlight({ now: () => clock });
+  const dlog = createDialogLog();
+  const cmds = [];
+  const run = (tab, type = "beforeunload") => maybeHandleDialog(tab, { type, message: "Leave site?" }, { inFlight, sendCommand: async (m, p) => cmds.push([tab, m, p]), log: dlog });
+  ok((await run(5)) === false && cmds.length === 0 && dlog.drain(5).length === 0, "no call in flight: the user's dialog is left alone (nothing sent, no note)");
+  inFlight.begin(5);
+  ok((await run(5)) === true && cmds.length === 1 && cmds[0][2].accept === false, "call in flight: dialog answered");
+  ok((await run(6)) === false, "a call on tab 5 does not make tab 6's dialogs ours");
+  inFlight.end(5);
+  clock += 1500;
+  ok((await run(5, "alert")) === true, "inside the grace window right after the call: still answered (late dialog from the action)");
+  clock += 600;
+  ok((await run(5, "confirm")) === false && cmds.length === 2, "after the grace window: left for the user again");
+  inFlight.begin(5); inFlight.begin(5); inFlight.end(5);
+  ok(inFlight.active(5), "two overlapping calls: still in flight after one ends");
+  inFlight.forget(5);
+  clock += 5000;
+  ok(!inFlight.active(5), "forget() on tab close clears it");
+}
+
+console.log("== wiring in the shipped dispatcher (H3, M1) ==");
+{
+  const disp = extractFunction("handleToolRequest");
+  ok(!/await\s+indicator\.touch/.test(disp) && /indicator\.touch\(args\.tabId\)/.test(disp), "H3: handleToolRequest does not await the indicator injection");
+  ok(/inFlight\.begin\(args\.tabId\)/.test(disp) && /finally\s*\{[^}]*inFlight\.end\(args\.tabId\)/.test(disp), "M1: a tool call marks its tab in flight and always un-marks it");
+  const bg = fs.readFileSync(path.join(ROOT, "extension", "background.js"), "utf8");
+  ok(/maybeHandleDialog\(tabId, params, \{\s*inFlight,/.test(bg) && !/[^e]handleDialogOpening\(tabId/.test(bg), "M1: the debugger event path goes through maybeHandleDialog with inFlight");
+  ok(/registerTools\(\{[^}]*finish: finishResult, inFlight/.test(bg), "L9: browser_batch gets the finish hook and inFlight");
+}
+
 console.log("== upload_image coordinate: drop in page ==");
 ok(mimeFromBase64("/9j/4AAQ") === "image/jpeg" && mimeFromBase64("iVBORw0K") === "image/png" && mimeFromBase64("data:image/png;base64,xx") === "image/jpeg", "mime sniff");
 const events = [];
@@ -134,7 +170,7 @@ ok(dropFileInPage("aGk=", "i.png", "image/png", 1, 2).ok === false, "no element 
 console.log("== upload_image validation (shipped handler) ==");
 const upload = compile(
   `const h = { ${extractMethod("upload_image")} };`,
-  { isInGroup: async () => true, screenshotStore: new Map([["s1", "/9j/AAAA"]]), mimeFromBase64, dropFileInPage,
+  { err, isInGroup: async () => true, screenshotStore: new Map([["s1", "/9j/AAAA"]]), mimeFromBase64, dropFileInPage,
     chrome: { scripting: { executeScript: async ({ args }) => [{ result: { ok: true, tag: "canvas", kb: 1, args } }] } } },
   "h"
 ).upload_image;
@@ -153,14 +189,26 @@ const finishResult = compile(
   "finishResult"
 );
 const t = (s) => ({ content: [{ type: "text", text: s }] });
-ok(finishResult(t("Tab 3 is not in the MCP group."), { tabId: 3 }).isError === true, "tab ownership text flagged");
-ok(finishResult(t("Error: nope"), {}).isError === true && finishResult(t("Could not scroll"), {}).isError === true, "Error:/Could not flagged");
-ok(finishResult(t("upload_image requires 'ref'"), {}).isError === true, "requires-text flagged");
-ok(finishResult(t("Title: x\nname is required here"), {}).isError === undefined, "success text containing 'is required' not flagged");
+ok(finishResult(t("Error: handling docs - MDN"), {}).isError === undefined && finishResult(t("Invalid email"), {}).isError === undefined, "M3: finishResult never infers an error from wording");
 ok(finishResult(t("Network requests (1):\nGET u → 200"), {}).isError === undefined, "plain success untouched");
 ok(finishResult({ ...t("[1/2 a] ok"), isError: true }, {}).isError === true, "existing isError kept (browser_batch failure)");
 ok(finishResult(t("ok"), { tabId: 5 }).content[1].text === "[JS dialog handled: boom]", "dialog notes appended for the tab");
 ok(finishResult(t("ok"), { tabId: 6 }).content.length === 1, "no notes for other tab");
+
+console.log("== M3: handlers flag their own failures (isError), no text inference ==");
+{
+  const refused = async () => { throw new Error("Tab 5 belongs to another session's tab group. Pass steal:true to take it over."); };
+  const h = compile(
+    `const h = { ${extractMethod("tabs_attach_mcp")}, ${extractMethod("tabs_detach_mcp")} };`,
+    { err, sessionTabs: { attach: refused, detach: refused, context: async () => ({ tabs: [], groupId: null }) }, formatTabContext: () => t("x") }, "h");
+  const a = await h.tabs_attach_mcp({ tabId: 5 }, "s");
+  ok(a.isError === true && /belongs to another session/.test(a.content[0].text), "tabs_attach_mcp refusal is isError (was invisible to batch stop-on-error)");
+  ok((await h.tabs_detach_mcp({ tabId: 5 }, "s")).isError === true, "tabs_detach_mcp refusal is isError");
+  // Regression net over EVERY handler: a failure-shaped text return must go through err().
+  const src = fs.readFileSync(path.join(ROOT, "extension", "background.js"), "utf8");
+  const bare = src.match(/return \{ content: \[\{ type: "text", text: [`"](Error\b|Failed\b|Could not\b|Unknown\b|Invalid\b|No element found\b|Tab \$\{[^}]*\} is not in the MCP group|[a-z_]+ (is|are) required|[a-z_]+ requires )[^\n]*/g) || [];
+  ok(bare.length === 0, `no failure-shaped result in background.js bypasses err() (${bare.length} found${bare[0] ? ": " + bare[0].slice(0, 90) : ""})`);
+}
 
 console.log("== cross-domain navigation ==");
 ok(isCrossDomain("https://a.com/x", "https://b.com/") && !isCrossDomain("https://a.com/x", "https://a.com/y"), "host compare");
@@ -190,19 +238,32 @@ let threw = false;
 try { await ind.touch(99); await ind.hidden(99, async () => 1); } catch { threw = true; }
 ok(!threw, "injection failure never fails a tool");
 
+console.log("== H3: a blocked tab (modal dialog / busy renderer) cannot hold the indicator hostage ==");
+{
+  globalThis.setTimeout = realTimers.setTimeout; globalThis.clearTimeout = realTimers.clearTimeout;
+  const hung = createIndicator(() => new Promise(() => {}), { boundMs: 50 }); // executeScript that never settles
+  const t0 = Date.now();
+  await hung.touch(1);
+  ok(Date.now() - t0 < 500, `touch returns after the bound even though the injection never settles (${Date.now() - t0} ms)`);
+  const ran = [];
+  const t1 = Date.now();
+  const v = await hung.hidden(1, async () => (ran.push("shot"), 7));
+  ok(v === 7 && ran.length === 1 && Date.now() - t1 < 1000, `hidden(): the wrapped screenshot still runs and returns (${Date.now() - t1} ms)`);
+}
+
 console.log("== navigate without tabId (shipped handler) ==");
 const navCalls = [];
 const mkNav = (tabs) => compile(
   `const h = { ${extractMethod("navigate")} };`,
-  { sessionTabs: { context: async (sid, create) => (navCalls.push([sid, create]), { tabs }) }, isInGroup: async (t) => t === 7,
+  { err, sessionTabs: { createdTab: async (sid) => (navCalls.push([sid]), tabs[0] || {}) }, isInGroup: async (t) => t === 7,
     chrome: { tabs: { update: async () => {}, get: async () => ({ id: 7, url: "https://a.com/", status: "complete", groupId: 1 }), query: async () => [{ id: 7, url: "https://a.com/" }],
       onUpdated: { addListener: (f) => f(7, { status: "complete" }), removeListener() {} } } } },
   "h"
 ).navigate;
 const navOk = await mkNav([{ id: 7 }])({ url: "a.com" }, "sess");
-ok(navCalls[0][0] === "sess" && navCalls[0][1] === true, "asks the session for its group with createIfEmpty");
-ok(/^Navigated to https:\/\/a\.com\//.test(txt(navOk)), "navigates the session's first tab");
-ok(/^Error: no tab available/.test(txt(await mkNav([])({ url: "a.com" }, "sess"))), "clear error when the session has no tab");
+ok(navCalls[0][0] === "sess", "L5: asks the session for a tab IT CREATED (never tabs[0] of everything it owns)");
+ok(/^Navigated to https:\/\/a\.com\//.test(txt(navOk)), "navigates that tab");
+ok(/^Error: no tab available/.test(txt(await mkNav([])({ url: "a.com" }, "sess"))) && (await mkNav([])({ url: "a.com" }, "sess")).isError === true, "clear error (isError) when the session has no tab");
 
 console.log(fail ? `\n${fail} FAILED` : "\nall passed");
 process.exit(fail ? 1 : 0);

@@ -54,6 +54,17 @@ export async function handleDialogOpening(tabId, params, { sendCommand, log }) {
   return accept;
 }
 
+/**
+ * Page.javascriptDialogOpening policy: answer the dialog only while a tool call
+ * for this tab is in flight (or just ended, see inflight.js). Otherwise it is
+ * the user's dialog in the user's tab and is left for them. Returns whether we handled it.
+ */
+export async function maybeHandleDialog(tabId, params, { inFlight, sendCommand, log }) {
+  if (!inFlight.active(tabId)) return false;
+  await handleDialogOpening(tabId, params, { sendCommand, log });
+  return true;
+}
+
 /** Append pending dialog notes to a tool result (no-op when there are none). */
 export function withDialogNotes(result, notes) {
   if (!notes || notes.length === 0 || !result || !Array.isArray(result.content)) return result;

@@ -185,6 +185,18 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     return { tabs: groups.flatMap((g) => g.tabs), groupId: groups.length ? groups[0].groupId : null };
   }
 
+  // The tab a tool with no tabId should drive: one this session CREATED (made
+  // if it has none). Never an attached tab, which belongs to the user.
+  function createdTab(sid) {
+    return serial(sid, async () => {
+      await load();
+      await touch(sid);
+      const s = get(sid);
+      const hit = (await liveGroups(sid)).flatMap((g) => g.tabs).find((t) => s.created.has(t.id));
+      return hit || (await createTabLocked(sid)).tab;
+    });
+  }
+
   // Who owns this live groupId, if anyone.
   function ownerOfGroup(groupId) {
     if (groupId === undefined || groupId < 0) return null;
@@ -362,7 +374,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
   }
 
   return {
-    sessions, load, touch, noteAlive, ownedTabs, assertTabOwned, createTab, context, attach, detach, close,
+    sessions, load, touch, noteAlive, ownedTabs, assertTabOwned, createTab, createdTab, context, attach, detach, close,
     listAll, endSession, sweepIdle, onTabRemoved, isManaged, allManagedTabIds
   };
 }

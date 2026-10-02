@@ -42,11 +42,24 @@ export function paintIndicator(show, id, lingerMs) {
  * run(tabId, show) injects paintIndicator. Every call is best-effort: restricted
  * pages (chrome://, the Web Store) refuse injection and must never fail a tool.
  */
-export function createIndicator(run) {
-  const safe = async (tabId, show) => {
-    try {
-      await run(tabId, show);
-    } catch {}
+export const BOUND_MS = 300;
+
+/**
+ * Every injection is bounded: a tab blocked in a modal dialog or a long
+ * synchronous loop never settles chrome.scripting.executeScript, and the
+ * indicator must not be able to hold a tool call (or the dialog handler behind
+ * it) hostage. After BOUND_MS we stop waiting; the injection is abandoned.
+ */
+export function createIndicator(run, { boundMs = BOUND_MS } = {}) {
+  const safe = (tabId, show) => {
+    let timer;
+    const bound = new Promise((resolve) => { timer = setTimeout(resolve, boundMs); });
+    const done = (async () => {
+      try {
+        await run(tabId, show);
+      } catch {}
+    })();
+    return Promise.race([done, bound]).finally(() => clearTimeout(timer));
   };
   return {
     touch: (tabId) => safe(tabId, true),

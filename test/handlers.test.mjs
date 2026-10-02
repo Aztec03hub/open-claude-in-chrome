@@ -1,6 +1,7 @@
 // Handler-level tests for #28 (no focus stealing) and #35 (set_tab_focus),
 // running the SHIPPED handler bodies against a mocked chrome.* API. Covers the
 // logic a browser test would cover, minus the browser.
+import { err } from "../extension/tools/result.js";
 import { extractMethod, extractFunction, compile } from "./_extract.mjs";
 let fail=0; const ok=(c,m)=>{console.log((c?"  PASS ":"  FAIL ")+m); if(!c)fail++;};
 
@@ -52,10 +53,10 @@ const src = [
   extractFunction("writeConfig")
 ].join("\n\n");
 const mk = new Function("chrome","tabGroupId","tabGroupTabs","isInGroup","ensureTabGroup","formatTabContext",
-  "CONFIG_KEY","TAB_CONFIG_KEY","CONFIG_SCHEMA","configState","configHydrated","humanSession","humanSessionSeed","human",
+  "CONFIG_KEY","TAB_CONFIG_KEY","CONFIG_SCHEMA","configState","configHydrated","humanSession","humanSessionSeed","human","err",
   src + "; return { H_set_tab_focus, H_get_config, H_set_config, effectiveConfig, writeConfig };");
 const H = mk(globalThis.chrome, tabGroupId, tabGroupTabs, isInGroup, ensureTabGroup, formatTabContext,
-  CONFIG_KEY, TAB_CONFIG_KEY, CONFIG_SCHEMA, configState, configHydrated, humanSession, humanSessionSeed, human);
+  CONFIG_KEY, TAB_CONFIG_KEY, CONFIG_SCHEMA, configState, configHydrated, humanSession, humanSessionSeed, human, err);
 
 // #28 (create tab: never selected, own window) moved to sessions.test.mjs
 

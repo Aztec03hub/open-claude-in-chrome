@@ -3,6 +3,7 @@
 import { runBatch, validateBatch, looksLikeError } from "../extension/tools/batch.js";
 import { encodeGif, planOverlays, frameDelay } from "../extension/tools/gif-encode.js";
 import { createGifTool, describeAction, MAX_FRAMES } from "../extension/tools/gif.js";
+import { err } from "../extension/tools/result.js";
 import { createShortcuts } from "../extension/tools/shortcuts.js";
 import { saveGifBlocks } from "../host/gif-save.js";
 import fs from "node:fs";
@@ -22,7 +23,8 @@ console.log("== browser_batch: sequencing and stop-on-error ==");
     navigate: async (a) => { log.push(["navigate", a]); return T("Navigated"); },
     tabs_context_mcp: async (a) => { log.push(["ctx", a]); return T("ctx"); },
     boom: async () => { throw new Error("kaput"); },
-    soft: async () => T("Tab 9 is not in the MCP group."),
+    soft: async () => err("Tab 9 is not in the MCP group."),
+    pageText: async () => T("Invalid email address"), // page DATA that merely reads like an error
     browser_batch: async () => T("never"),
   };
   const assertTabOwned = async (s, t) => { owned.push([s, t]); };
@@ -55,7 +57,23 @@ console.log("== browser_batch: sequencing and stop-on-error ==");
   ok(r.content.length === 2 && /Navigated/.test(r.content[0].text), "outputs of completed actions are still returned");
 
   r = await runBatch({ actions: [{ name: "navigate", input: { url: "u", tabId: 5 } }, { name: "soft", input: { tabId: 5 } }, { name: "navigate", input: { url: "x", tabId: 5 } }] }, { handlers, assertTabOwned });
-  ok(r.isError && /actions\[1\] \(soft\) failed: Tab 9 is not in the MCP group\. \(1 completed, 1 remaining\)/.test(r.content.at(-1).text), "text-shaped failure (handlers return errors as text) also stops the batch");
+  ok(r.isError && /actions\[1\] \(soft\) failed: Tab 9 is not in the MCP group\. \(1 completed, 1 remaining\)/.test(r.content.at(-1).text), "a handler's err() result (isError) stops the batch");
+  log.length = 0;
+  r = await runBatch({ actions: [{ name: "pageText", input: { tabId: 5 } }, { name: "navigate", input: { url: "x", tabId: 5 } }] }, { handlers, assertTabOwned });
+  ok(!r.isError && log.length === 1 && /Invalid email address/.test(r.content[0].text), "M3: successful text that reads like an error does not stop the batch");
+
+  // L9: per-action finish hook (dialog notes) and in-flight marking for the whole batch.
+  const fin = [], flight = [];
+  r = await runBatch({ actions: [{ name: "navigate", input: { url: "a", tabId: 5 } }, { name: "computer", input: { action: "screenshot", tabId: 6 } }] }, {
+    handlers, assertTabOwned,
+    finish: (res, input) => { fin.push(input.tabId); return { ...res, content: [...res.content, { type: "text", text: `[note ${input.tabId}]` }] }; },
+    inFlight: { begin: (t) => flight.push(["b", t]), end: (t) => flight.push(["e", t]) },
+  });
+  ok(fin.join() === "5,6" && r.content.some((c) => c.text === "[note 5]") && r.content.some((c) => c.text === "[note 6]"), "L9: finish() runs for every sub-action and its note reaches the output");
+  ok(flight.join(";") === "b,5;b,6;e,5;e,6", "L9: batch tabs are in flight for the whole batch (ends after the last action)");
+  flight.length = 0;
+  await runBatch({ actions: [{ name: "boom", input: { tabId: 5 } }] }, { handlers, assertTabOwned, inFlight: { begin: (t) => flight.push(["b", t]), end: (t) => flight.push(["e", t]) } });
+  ok(flight.join(";") === "b,5;e,5", "in-flight ends even when an action throws");
 
   const denied = async (s, t) => { if (t === 7) throw new Error("Tab 7 is not in Claude's tab group for this session"); };
   log.length = 0;
@@ -88,7 +106,7 @@ console.log("== browser_batch: validation ==");
   ok(/name must be a string/.test(validateBatch({ actions: [{ input: {} }] }, h)), "missing name");
   const r = await runBatch({ actions: [{ name: "navigate", input: { tabId: 1 } }, { name: "browser_batch", input: {} }] }, { handlers: h });
   ok(r.isError && /cannot be nested/.test(r.content[0].text), "invalid batch runs nothing and is an error");
-  ok(looksLikeError({ isError: true, content: [] }) && looksLikeError(T("Error: x")) && looksLikeError(T("Could not resolve ref")) && !looksLikeError(T("Clicked at (1,2)")) && !looksLikeError(T("Navigated to https://x")), "looksLikeError heuristics");
+  ok(looksLikeError({ isError: true, content: [] }) && !looksLikeError(T("Error: x")) && !looksLikeError(T("Could not resolve ref")) && !looksLikeError(T("Clicked at (1,2)")) && !looksLikeError(null), "M3: looksLikeError is exactly result.isError, no text inference");
 }
 
 console.log("== GIF assembly (synthetic frames) ==");
