@@ -21,7 +21,7 @@ import crypto from "node:crypto";
 
 import { getPipePath } from "./endpoint.js";
 import { noteActivity } from "./parent-watch.js";
-import { isWsl, windowsPipePath, connectViaWindowsNode } from "./wsl-transport.js";
+import { isWsl, windowsPipePath, connectViaWindowsNode, reconnectDelay } from "./wsl-transport.js";
 import { filesFromPaths } from "./file-upload.js";
 import { findWithModel } from "./find-model.js";
 import { saveGifBlocks } from "./gif-save.js";
@@ -41,7 +41,11 @@ const REQUEST_TIMEOUT_MS = 60_000;
 // background.js reconnects 250ms later. A call landing in that window should
 // wait for the bridge to come back rather than fail.
 const LINK_GRACE_MS = 5_000;
-const RECONNECT_MS = WSL ? 1000 : 500; // each WSL retry spawns node.exe
+const RECONNECT_MS = Number(process.env.OCIC_RECONNECT_MS) || (WSL ? 1000 : 500); // each WSL retry spawns node.exe
+const RECONNECT_MAX_MS = Number(process.env.OCIC_RECONNECT_MAX_MS) || 30_000;
+let reconnectFailures = 0;
+const nextReconnectMs = () =>
+  reconnectDelay(reconnectFailures++, { wsl: WSL, hasPending: pendingRequests.size > 0, base: RECONNECT_MS, max: RECONNECT_MAX_MS });
 
 let started = false;
 let socket = null;
@@ -132,7 +136,7 @@ function connect() {
   } catch (err) {
     if (!warnedNoRelay) process.stderr.write(`Cannot reach the Windows bridge: ${err.message}\n`);
     warnedNoRelay = true;
-    if (!shuttingDown && !reconnectTimer) reconnectTimer = setTimeout(connect, RECONNECT_MS);
+    if (!shuttingDown && !reconnectTimer) reconnectTimer = setTimeout(connect, nextReconnectMs());
     return;
   }
   socket = sock;
@@ -141,6 +145,7 @@ function connect() {
 
   sock.on("connect", () => {
     established = true;
+    reconnectFailures = 0;
     sock.write(JSON.stringify({ type: "client_hello", session_id: SESSION_ID }) + "\n");
     process.stderr.write(`Joined the browser bridge at ${PIPE_PATH}\n`);
   });
@@ -171,7 +176,7 @@ function connect() {
     if (socket === sock) socket = null;
     failPending();
     if (!shuttingDown && !reconnectTimer) {
-      reconnectTimer = setTimeout(connect, RECONNECT_MS);
+      reconnectTimer = setTimeout(connect, nextReconnectMs());
     }
   });
 }
@@ -209,6 +214,13 @@ function sendToExtension(tool, args) {
       entry.sent = true;
       socket.write(line);
       return;
+    }
+
+    // Idle backoff may have parked the next attempt far away; a caller is
+    // waiting now, so try immediately.
+    if (reconnectTimer && !socket && !shuttingDown) {
+      clearTimeout(reconnectTimer);
+      connect();
     }
 
     waitForLink(LINK_GRACE_MS).then((ok) => {
@@ -301,7 +313,8 @@ export async function callTool(toolName, args) {
     if (typeof result === "string") return textResult(result);
     // Extension-side error results arrive already flagged (handleToolRequest).
     // gif_creator export returns the GIF bytes; keep them as a file here.
-    if (result && result.content) return toolName === "gif_creator" ? saveGifBlocks(result) : result;
+    // browser_batch can contain a gif_creator export; saveGifBlocks is a no-op without GIF blocks.
+    if (result && result.content) return toolName === "gif_creator" || toolName === "browser_batch" ? saveGifBlocks(result) : result;
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
     return { ...textResult(`Error: ${err.message}`), isError: true };

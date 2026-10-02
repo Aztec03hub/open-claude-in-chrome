@@ -13,11 +13,13 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { Duplex } from "node:stream";
 
-// Runs under Windows node.exe. Prints "ok" on STDERR once the pipe is open, so
-// the data stream stays pure protocol.
+// Runs under Windows node.exe. Prints the OCIC_RELAY_OK sentinel on STDERR once
+// the pipe is open, so the data stream stays pure protocol. A sentinel, not "ok":
+// any Node warning on stderr could contain those two letters.
+export const RELAY_OK = "OCIC_RELAY_OK";
 export const RELAY_JS =
   "const s=require('net').connect(process.argv[1]);" +
-  "s.on('connect',()=>process.stderr.write('ok\\n'));" +
+  "s.on('connect',()=>process.stderr.write('" + RELAY_OK + "\\n'));" +
   "s.on('error',e=>{process.stderr.write('pipe: '+e.message+'\\n');process.exit(1)});" +
   "process.stdin.pipe(s);s.pipe(process.stdout);" +
   "s.on('close',()=>process.exit(0));process.stdin.on('end',()=>s.end());";
@@ -58,6 +60,15 @@ export function windowsPipePath(env = process.env, config = configFile()) {
   for (const p of [env.OCIC_PIPE, config.pipe]) if (p && p.startsWith("\\\\.\\pipe\\")) return p;
   const user = windowsUser(env, config).replace(/[^\w.-]/g, "_").slice(0, 32);
   return `\\\\.\\pipe\\open-claude-in-chrome-${user}`;
+}
+
+// Delay before the next reconnect attempt. Each WSL attempt spawns a Windows
+// node.exe, so while Chrome is closed back off (base, 2x, 4x ... up to max)
+// instead of launching one per second per session forever. A request that is
+// waiting for the bridge gets the base delay: it is about to time out.
+export function reconnectDelay(failures, { wsl, hasPending = false, base = 1000, max = 30_000 } = {}) {
+  if (!wsl || hasPending) return base;
+  return Math.min(base * 2 ** Math.min(failures, 16), max);
 }
 
 function versionKey(p) {
@@ -110,8 +121,11 @@ export function relayStream(child) {
   child.stdout.on("data", (d) => sock.push(d));
   child.stdout.on("end", () => sock.push(null));
   child.stdin.on("error", () => {});
+  let errText = "";
   child.stderr.on("data", (d) => {
-    if (!open && String(d).includes("ok")) {
+    if (open) return;
+    errText += String(d);
+    if (new RegExp(`^${RELAY_OK}\\r?$`, "m").test(errText)) {
       open = true;
       sock.emit("connect");
     }

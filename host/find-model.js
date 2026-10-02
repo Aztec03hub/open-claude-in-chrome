@@ -139,8 +139,9 @@ export async function findWithModel(args, call, ask = askHaiku) {
     return fallback(`could not read the page: ${e.message}`);
   }
   const tree = textOf(raw).replace(/\n\nViewport: \S+$/, "");
-  // A group/ownership error from read_page is the answer, not a reason to retry.
-  if (/is not in the MCP group/.test(tree)) return raw;
+  // An error result from read_page (ownership, no such tab, ...) is the answer,
+  // not a reason to retry with a substring find that would fail the same way.
+  if (raw && raw.isError) return raw;
   if (!/\[ref_\d+\]/.test(tree)) return fallback("page has no readable accessibility tree");
 
   let reply;

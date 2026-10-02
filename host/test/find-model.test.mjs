@@ -55,9 +55,14 @@ console.log("== findWithModel ==");
   res = await findWithModel({ query: "x", tabId: 4 }, call, async () => "FOUND: 0\nERROR: no cart here");
   ok(res.content[0].text === "no cart here", "model says nothing matches -> that is the answer, no fallback");
 
-  const bad = async (t) => (t === "read_page" ? { content: [{ type: "text", text: "Tab 4 is not in the MCP group." }] } : T());
+  const bad = async (t) => (t === "read_page" ? { content: [{ type: "text", text: "Tab 4 is not in the MCP group." }], isError: true } : T());
   res = await findWithModel({ query: "x", tabId: 4 }, bad, async () => { throw new Error("must not be called"); });
   ok(/is not in the MCP group/.test(res.content[0].text), "group error from read_page is returned as is");
+  // L1: the ownership gate's CURRENT wording; matching on text missed it and produced a "model unavailable" fallback
+  const gate = async (t) => (t === "read_page" ? { content: [{ type: "text", text: "Tab 4 is not in this session's tab group. Valid tab IDs are: 9." }], isError: true } : T());
+  calls.length = 0;
+  res = await findWithModel({ query: "x", tabId: 4 }, async (t, a) => (calls.push(t), gate(t, a)), async () => { throw new Error("must not be called"); });
+  ok(res.isError === true && /not in this session's tab group/.test(res.content[0].text) && !/unavailable/.test(res.content[0].text) && calls.join() === "read_page", "L1: any isError result from read_page is returned as is (no fallback, no second call)");
 
   const empty = async (t) => (t === "read_page" ? { content: [{ type: "text", text: "Error: Could not generate accessibility tree" }] } : { content: [{ type: "text", text: "No elements found" }] });
   res = await findWithModel({ query: "x", tabId: 4 }, empty, async () => { throw new Error("must not be called"); });

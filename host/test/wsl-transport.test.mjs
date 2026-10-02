@@ -12,7 +12,7 @@ import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 
-import { isWsl, windowsPipePath, windowsUser, relayStream, findWindowsNode, RELAY_JS } from "../wsl-transport.js";
+import { isWsl, windowsPipePath, windowsUser, relayStream, findWindowsNode, RELAY_JS, RELAY_OK, reconnectDelay } from "../wsl-transport.js";
 import { filesFromPaths } from "../file-upload.js";
 import { nativeSizeError } from "../native-limit.js";
 
@@ -53,18 +53,30 @@ test("pipe name: matches endpoint.js win32 derivation; win user override", async
   }
 });
 
+test("reconnectDelay (L3): WSL backs off to a cap, resets, and never delays a waiting request", () => {
+  const w = (failures, extra = {}) => reconnectDelay(failures, { wsl: true, ...extra });
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 10].map((n) => w(n)), [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+  assert.equal(w(9, { hasPending: true }), 1000, "a caller is waiting: base delay");
+  assert.equal(reconnectDelay(9, { wsl: false, base: 500 }), 500, "native: constant");
+});
+
 test("findWindowsNode: env override, newest version wins", () => {
   assert.equal(findWindowsNode({ OCIC_WIN_NODE: "/x/node.exe" }), "/x/node.exe");
 });
 
-test("relayStream: connect on 'ok', pure data both ways, close with child", async () => {
+test("relayStream: connect on the sentinel, pure data both ways, close with child", async () => {
   const child = Object.assign(new EventEmitter(), {
     stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() { this.killed = true; }
   });
   const sock = relayStream(child);
   assert.equal(sock.readyState, "closed");
   const connected = new Promise((r) => sock.once("connect", r));
-  child.stderr.write("ok\n");
+  // L4: stderr noise that merely contains "ok" must not open the stream
+  child.stderr.write("(node:7) Warning: token ok? deprecated\n");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sock.readyState, "closed", "a warning containing 'ok' does not mean the pipe is open");
+  child.stderr.write(RELAY_OK.slice(0, 5));
+  child.stderr.write(RELAY_OK.slice(5) + "\n"); // sentinel split across chunks
   await connected;
   assert.equal(sock.readyState, "open");
   const got = [];
