@@ -12,7 +12,6 @@ import { createShortcuts } from "./shortcuts.js";
 
 export function registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore, assertTabOwned, selfChecked, finish, inFlight }) {
   const gif = createGifTool({
-    storage: chrome.storage.session,
     getTab: (id) => chrome.tabs.get(id),
     capture: async (tabId) => {
       const { base64, imageId } = await takeScreenshot(tabId);
@@ -66,4 +65,7 @@ export function registerTools({ toolHandlers, isInGroup, takeScreenshot, screens
     shortcuts_save: (args) => shortcuts.shortcuts_save(args),
     browser_batch: (args, sid) => runBatch(args, { handlers: toolHandlers, sessionId: sid, assertTabOwned, selfChecked, finish, inFlight }),
   });
+
+  // Called when a tab group stops existing (session ended, last tab closed).
+  return { dropGifGroup: (groupId) => gif.dropGroupId(groupId) };
 }

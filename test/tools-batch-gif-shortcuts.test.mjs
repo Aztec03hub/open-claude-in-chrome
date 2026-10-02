@@ -176,12 +176,16 @@ console.log("== gif_creator state machine ==");
   ok(/Captured 4 frames/.test(txt(await g.handler({ action: "stop_recording", tabId: 1 }))), "stop_recording takes a final frame and reports the count");
   await g.afterAction(1, "computer", { action: "left_click" });
   ok(g._state.frames.get("g10").length === 4, "no capture after stop");
-  // survive a service-worker restart: a fresh instance hydrates from storage
-  const g2 = mkTool();
+  // M7: frames are never written to chrome.storage (it shares a 10 MB quota with the session map)
+  ok(Object.keys(store).length === 0, "M7: no frame (or meta) was written to storage.session while recording");
+  const g2 = g;
   let r = await g2.handler({ action: "export", tabId: 1, download: true, filename: "out.gif" });
-  ok(/Successfully exported GIF with 4 frames/.test(txt(r)) && /Downloaded "out.gif"/.test(txt(r)) && downloads[0] === "out.gif", "export after a worker restart still has the frames; download path used");
+  ok(/Successfully exported GIF with 4 frames/.test(txt(r)) && /Downloaded "out.gif"/.test(txt(r)) && downloads[0] === "out.gif", "export has the in-memory frames; download path used");
   ok(/Recording cleared/.test(txt(r)) && /No frames/.test(txt(await g2.handler({ action: "export", tabId: 1, download: true }))), "export clears the recording");
-  ok(!Object.keys(store).some((k) => k.startsWith("ocic_gif_f_")), "stored frames are removed on clear");
+  await g2.handler({ action: "start_recording", tabId: 1 });
+  ok(g2._state.frames.get("g10").length === 1, "M7: a recording that is never exported holds frames...");
+  g2.dropGroupId(10);
+  ok(!g2._state.frames.has("g10") && !g2._state.recording.has("g10"), "M7: ...until the group goes away (dropGroupId frees them and stops the recording)");
 
   await g2.handler({ action: "start_recording", tabId: 1 });
   r = await g2.handler({ action: "export", tabId: 1 });

@@ -242,6 +242,27 @@ console.log("== L5: createdTab never picks an attached (user) tab ==");
   ok((await S.createdTab("A")).id === t.id && st.tabs.length === 2, "second call reuses the created tab");
 }
 
+console.log("== M7: groups that end are reported (so GIF frames are freed) ==");
+{
+  const gone = [];
+  const { S, st } = mk([], { onGroupsGone: (ids) => gone.push(...ids) });
+  const a = await S.createTab("A");
+  await S.endSession("A");
+  ok(gone.includes(a.groupId), "session end reports its groups");
+  const b = await S.createTab("B");
+  await S.close("B", [b.tab.id]);
+  ok(gone.includes(b.groupId), "closing a group's last tab reports the group");
+}
+
+console.log("== M7: persist() failures are logged, not swallowed ==");
+{
+  const logs = [];
+  const { chrome, S } = mk([], { dbg: (k, m) => logs.push(`${k}:${m}`) });
+  chrome.storage.session.set = async () => { throw new Error("QUOTA_BYTES quota exceeded"); };
+  await S.createTab("A");
+  ok(logs.some((l) => /persist failed/.test(l)), "a full session store shows up in the debug log");
+}
+
 console.log("== listAll ==");
 {
   const { S } = mk([{ id: 1, windowId: 7, title: "u", url: "x" }]);

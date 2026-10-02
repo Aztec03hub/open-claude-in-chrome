@@ -19,7 +19,7 @@ export const sidOf = (raw) => (raw === undefined || raw === null || raw === "" ?
 const titleFor = (index) => (index === 1 ? "Claude" : `Claude ${index}`);
 const colorFor = (index) => COLORS[(index - 1) % COLORS.length];
 
-export function createSessions(chrome, { now = Date.now, onRelease = async () => {}, dbg = () => {} } = {}) {
+export function createSessions(chrome, { now = Date.now, onRelease = async () => {}, onGroupsGone = () => {}, dbg = () => {} } = {}) {
   // sid -> { index, groupIds: number[], created: Set<tabId>, attached: Set<tabId>, lastSeen,
   //          restore: Map<tabId, {groupId, pinned}> }  (what an attached tab looked like before we took it)
   const sessions = new Map();
@@ -68,8 +68,10 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
       } catch {}
     }
     if (live.length !== s.groupIds.length) {
+      const gone = s.groupIds.filter((id) => !live.some((g) => g.groupId === id));
       s.groupIds = live.map((g) => g.groupId);
       await persist();
+      try { onGroupsGone(gone); } catch {}
     }
     return live;
   }
@@ -334,6 +336,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
       if (closed.length) { try { await chrome.tabs.remove(closed); } catch {} }
       sessions.delete(sid);
       await persist();
+      try { onGroupsGone(s.groupIds); } catch {}
       return { closed, ungrouped };
     });
   }

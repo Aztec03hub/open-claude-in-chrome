@@ -11,8 +11,6 @@
 //    server, which saves it to a file on ITS machine and reports the path.
 
 export const MAX_FRAMES = 50;
-const META_KEY = "ocic_gif_meta_v1";
-const frameKey = (group, n) => `ocic_gif_f_${group}_${n}`;
 
 /** What happened, for the overlay label / indicator. */
 export function describeAction(tool, args) {
@@ -32,32 +30,17 @@ export function describeAction(tool, args) {
   return a;
 }
 
-export function createGifTool({ storage, getTab, capture, render, download, drop, now = Date.now }) {
+// Frames live in memory only. They used to be mirrored into chrome.storage.session,
+// but that area is capped at 10 MB and shared with the session ownership map: a
+// long recording filled it and silently stopped ownership from being saved. A
+// recording therefore does not survive a service-worker restart (the native-host
+// connection keeps the worker alive in normal use); dropGroupId() frees a
+// group's frames when its session ends or its last tab closes.
+export function createGifTool({ getTab, capture, render, download, drop, now = Date.now }) {
   const frames = new Map(); // groupKey -> [{ base64, action, ts }]
   const recording = new Set();
-  let hydrated = null;
 
   const groupKeyOf = (tab) => (tab.groupId >= 0 ? `g${tab.groupId}` : `t${tab.id}`);
-
-  const persistMeta = () =>
-    storage.set({ [META_KEY]: { recording: [...recording], counts: Object.fromEntries([...frames].map(([k, v]) => [k, v.length])) } });
-
-  // The service worker can be evicted mid-recording; frames live in storage.session.
-  function hydrate() {
-    hydrated ||= (async () => {
-      try {
-        const { [META_KEY]: meta } = await storage.get(META_KEY);
-        if (!meta) return;
-        for (const k of meta.recording || []) recording.add(k);
-        for (const [k, n] of Object.entries(meta.counts || {})) {
-          const keys = Array.from({ length: n }, (_, i) => frameKey(k, i));
-          const got = await storage.get(keys);
-          frames.set(k, keys.map((fk) => got[fk]).filter(Boolean));
-        }
-      } catch {}
-    })();
-    return hydrated;
-  }
 
   async function addFrame(key, base64, action) {
     const list = frames.get(key) || [];
@@ -65,22 +48,12 @@ export function createGifTool({ storage, getTab, capture, render, download, drop
     const f = { base64, action: action || null, ts: now() };
     list.push(f);
     frames.set(key, list);
-    // Persisting is best-effort: storage.session is capped (~10 MB), 50 JPEG
-    // frames can exceed it. The in-memory copy is what export uses; storage only
-    // lets a recording survive service-worker eviction.
-    try {
-      await storage.set({ [frameKey(key, list.length - 1)]: f });
-      await persistMeta();
-    } catch {}
     return true;
   }
 
-  async function dropGroup(key) {
-    const n = (frames.get(key) || []).length;
+  function dropGroup(key) {
     frames.delete(key);
     recording.delete(key);
-    await storage.remove(Array.from({ length: n }, (_, i) => frameKey(key, i))).catch(() => {});
-    await persistMeta();
   }
 
   async function grab(tabId, key, action) {
@@ -94,7 +67,6 @@ export function createGifTool({ storage, getTab, capture, render, download, drop
 
   /** Call after a successful computer/navigate action. No-op unless recording. */
   async function afterAction(tabId, tool, args) {
-    await hydrate();
     let tab;
     try { tab = await getTab(tabId); } catch { return; }
     const key = groupKeyOf(tab);
@@ -106,16 +78,14 @@ export function createGifTool({ storage, getTab, capture, render, download, drop
     const text = (output) => ({ content: [{ type: "text", text: output }] });
     const err = (m) => ({ content: [{ type: "text", text: `Failed to execute gif_creator: ${m}` }], isError: true });
     if (!args || !args.action) return err("action parameter is required");
-    await hydrate();
     const tab = await getTab(args.tabId);
     const key = groupKeyOf(tab);
 
     switch (args.action) {
       case "start_recording": {
         if (recording.has(key)) return text("Recording is already active for this tab group. Use 'stop_recording' to stop or 'export' to generate GIF.");
-        await dropGroup(key);
+        dropGroup(key);
         recording.add(key);
-        await persistMeta();
         await grab(args.tabId, key, { type: "screenshot" });
         return text(`Started recording browser actions for this tab group. All computer and navigate tool actions will now be captured (max ${MAX_FRAMES} frames). The current page was captured as the first frame. Previous frames cleared.`);
       }
@@ -123,14 +93,13 @@ export function createGifTool({ storage, getTab, capture, render, download, drop
         if (!recording.has(key)) return text("Recording is not active for this tab group. Use 'start_recording' to begin capturing.");
         await grab(args.tabId, key, { type: "screenshot" });
         recording.delete(key);
-        await persistMeta();
         const n = (frames.get(key) || []).length;
         return text(`Stopped recording for this tab group. Captured ${n} frame${n === 1 ? "" : "s"} (the final page state is the last frame). Use 'export' to generate GIF or 'clear' to discard.`);
       }
       case "clear": {
         const n = (frames.get(key) || []).length;
         if (n === 0 && !recording.has(key)) return text("No frames to clear for this tab group.");
-        await dropGroup(key);
+        dropGroup(key);
         return text(`Cleared ${n} frame${n === 1 ? "" : "s"} for this tab group. Recording stopped.`);
       }
       case "export": {
@@ -150,7 +119,7 @@ export function createGifTool({ storage, getTab, capture, render, download, drop
           msg = `Successfully exported GIF with ${list.length} frames (${kb}KB). ${dims} Filename: ${filename}`;
           content = { type: "image", mimeType: "image/gif", data: toBase64(out.bytes) };
         }
-        await dropGroup(key);
+        dropGroup(key);
         return { content: [{ type: "text", text: `${msg} Recording cleared.` }, ...(content ? [content] : [])] };
       }
       default:
@@ -158,7 +127,7 @@ export function createGifTool({ storage, getTab, capture, render, download, drop
     }
   }
 
-  return { handler, afterAction, _state: { frames, recording } };
+  return { handler, afterAction, dropGroupId: (groupId) => dropGroup(`g${groupId}`), _state: { frames, recording } };
 }
 
 export function toBase64(bytes) {

@@ -277,8 +277,11 @@ function nativeRequest(msg) {
 // to the live tab or throws "Tab X is not in this session's tab group. Valid
 // tab IDs are: ...". handleToolRequest runs it for every tool carrying a
 // tabId; browser_batch must call it per sub-call (sessions.assertTabOwned).
+let dropGifGroup = () => {}; // set once registerTools has built the gif tool
 const sessionTabs = createSessions(chrome, {
   dbg: (...a) => dbg(...a),
+  // A group that ended (session over, last tab closed) must not keep GIF frames in memory.
+  onGroupsGone: (ids) => ids.forEach((id) => dropGifGroup(id)),
   // Never leave a CDP debugger (and its infobar) on a tab we stop managing.
   onRelease: async (tabId) => {
     if (attachedTabs.has(tabId)) {
@@ -2678,7 +2681,7 @@ async function uploadFilesFromBytes(tabId, ref, files) {
 
 // Tab-lifecycle tools that do their own ownership checks.
 const SELF_CHECKED_TOOLS = new Set(["tabs_attach_mcp", "tabs_detach_mcp", "tabs_close_mcp", "tabs_list_all"]);
-registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore, assertTabOwned, selfChecked: SELF_CHECKED_TOOLS, finish: finishResult, inFlight });
+({ dropGifGroup } = registerTools({ toolHandlers, isInGroup, takeScreenshot, screenshotStore, assertTabOwned, selfChecked: SELF_CHECKED_TOOLS, finish: finishResult, inFlight }));
 
 // --- Tool dispatch ---
 // Central result post-processing for every tool call (also run per action by
