@@ -17,8 +17,23 @@ export function gifFileName(requested, dir, stamp) {
   let base = path.basename(requested.replace(/\\/g, "/")).replace(/[^\w.\- ]/g, "_").trim();
   if (!base || base === "." || base === "..") return null;
   if (!/\.gif$/i.test(base)) base += ".gif";
-  if (fs.existsSync(path.join(dir, base))) base = base.replace(/\.gif$/i, `-${stamp}.gif`);
+  // L4: never overwrite, also not a file this same call wrote a moment ago.
+  const stem = base.replace(/\.gif$/i, "");
+  for (let k = 0; fs.existsSync(path.join(dir, base)); k++) base = `${stem}-${stamp}${k ? `-${k + 1}` : ""}.gif`;
   return base;
+}
+
+// Does this gif_creator call return the GIF as an image block (and so need a
+// filename here)? Mirrors extension/tools/gif.js: download:true and a drop
+// coordinate return text only.
+export function exportsImage(input) {
+  return !!input && input.action === "export" && input.download !== true && !(Array.isArray(input.coordinate) && input.coordinate.length === 2);
+}
+
+/** The requested export filenames, in the order the GIF image blocks come back. */
+export function exportNames(toolName, args) {
+  if (toolName === "gif_creator") return [args.filename];
+  return (args.actions || []).filter((a) => a && a.name === "gif_creator" && exportsImage(a.input)).map((a) => a.input.filename);
 }
 
 /**

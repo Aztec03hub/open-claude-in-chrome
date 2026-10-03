@@ -5,7 +5,7 @@ import { encodeGif, planOverlays, frameDelay } from "../extension/tools/gif-enco
 import { createGifTool, describeAction, MAX_FRAMES } from "../extension/tools/gif.js";
 import { err } from "../extension/tools/result.js";
 import { createShortcuts } from "../extension/tools/shortcuts.js";
-import { saveGifBlocks } from "../host/gif-save.js";
+import { saveGifBlocks, exportNames, gifFileName } from "../host/gif-save.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -217,6 +217,23 @@ console.log("== gif_creator state machine ==");
   ok(again !== named && /demo-.*\.gif$/.test(again) && fs.readFileSync(path.join(dir, "demo.gif"), "latin1") === "GIF89a", "an existing file is never overwritten");
   const safe = saveGifBlocks(gifBlock(), dir, ["../../etc/evil"]).content[0].text;
   ok(safe === `GIF saved to ${path.join(dir, "evil.gif")}`, "path components stripped and .gif added");
+
+  // L4 (review 00eac49): names line up with the image blocks, and duplicates never overwrite each other.
+  const batch = { actions: [
+    { name: "gif_creator", input: { action: "export", download: true, filename: "skipped.gif" } },
+    { name: "gif_creator", input: { action: "export", coordinate: [1, 2], filename: "dropped.gif" } },
+    { name: "computer", input: { action: "screenshot" } },
+    { name: "gif_creator", input: { action: "export", filename: "first.gif" } },
+    { name: "gif_creator", input: { action: "export", filename: "second.gif" } },
+  ] };
+  ok(exportNames("browser_batch", batch).join() === "first.gif,second.gif", "L4: only exports that return an image block contribute a filename (download/coordinate exports do not shift the names)");
+  ok(exportNames("gif_creator", { action: "export", filename: "a.gif" }).join() === "a.gif", "single gif_creator keeps its filename");
+  const three = { content: [0, 1, 2].map((i) => ({ type: "image", mimeType: "image/gif", data: Buffer.from("GIF89a" + i).toString("base64") })) };
+  const d3 = fs.mkdtempSync(path.join(os.tmpdir(), "gifsave3-"));
+  fs.writeFileSync(path.join(d3, "dup.gif"), "old");
+  const files = saveGifBlocks(three, d3, ["dup.gif", "dup.gif", "dup.gif"]).content.map((c) => c.text.replace("GIF saved to ", ""));
+  ok(new Set(files).size === 3 && files.every((f) => fs.existsSync(f)) && fs.readFileSync(path.join(d3, "dup.gif"), "latin1") === "old", "L4: three same-name exports in one call land in three files; the existing one is untouched");
+  ok(files.map((f) => fs.readFileSync(f, "latin1")).join() === "GIF89a0,GIF89a1,GIF89a2", "each file holds its own GIF (the third did not overwrite the second)");
 }
 
 console.log("== shortcuts ==");

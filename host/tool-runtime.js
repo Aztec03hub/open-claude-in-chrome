@@ -24,7 +24,7 @@ import { noteActivity } from "./parent-watch.js";
 import { isWsl, windowsPipePath, connectViaWindowsNode, reconnectDelay } from "./wsl-transport.js";
 import { filesFromPaths } from "./file-upload.js";
 import { findWithModel } from "./find-model.js";
-import { saveGifBlocks } from "./gif-save.js";
+import { saveGifBlocks, exportNames } from "./gif-save.js";
 
 // Under WSL the host's pipe is a Windows named pipe, reached through a Windows
 // node.exe relay child (wsl-transport.js).
@@ -317,13 +317,7 @@ export async function callTool(toolName, args) {
     if (result && result.content) {
       if (toolName !== "gif_creator" && toolName !== "browser_batch") return result;
       // The requested export filenames, in the order the GIFs come back.
-      const names =
-        toolName === "gif_creator"
-          ? [coerced.filename]
-          : (coerced.actions || [])
-              .filter((a) => a && a.name === "gif_creator" && a.input && a.input.action === "export")
-              .map((a) => a.input.filename);
-      return saveGifBlocks(result, undefined, names);
+      return saveGifBlocks(result, undefined, exportNames(toolName, coerced));
     }
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
