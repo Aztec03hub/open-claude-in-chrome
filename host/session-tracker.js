@@ -9,7 +9,12 @@
 // - alive() is broadcast periodically so the extension's idle clock never
 //   expires for a session that is still connected.
 
-export function createSessionTracker({ send, graceMs = 60_000 } = {}) {
+// L5: must stay at least two WSL reconnect-backoff ceilings (wsl-transport.js
+// reconnectDelay max, 20 s), or a quiet client that is merely backing off gets
+// its session ended while it is still running.
+export const DEFAULT_GRACE_MS = 120_000;
+
+export function createSessionTracker({ send, graceMs = DEFAULT_GRACE_MS } = {}) {
   const byClient = new Map(); // clientId -> Set<sid>
   const pending = new Map(); // sid -> timer
 
@@ -17,7 +22,8 @@ export function createSessionTracker({ send, graceMs = 60_000 } = {}) {
 
   return {
     seen(clientId, sid) {
-      if (!sid) return;
+      // A client that never sends a session_id is the extension's "default" session.
+      sid = sid || "default";
       let set = byClient.get(clientId);
       if (!set) byClient.set(clientId, (set = new Set()));
       set.add(sid);

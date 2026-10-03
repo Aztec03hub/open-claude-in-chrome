@@ -9,7 +9,8 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { createSessionTracker } from "../session-tracker.js";
+import { createSessionTracker, DEFAULT_GRACE_MS } from "../session-tracker.js";
+import { reconnectDelay } from "../wsl-transport.js";
 
 const HOST = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "native-host.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -28,6 +29,22 @@ test("tracker: close ends the session after the grace period, a re-claim cancels
   t.ended("B"); // client said goodbye itself: no duplicate session_end
   await sleep(90);
   assert.equal(sent.length, 1);
+  t.stop();
+});
+
+test("tracker (L5): the default grace outlasts two WSL reconnect-backoff ceilings", () => {
+  const ceiling = reconnectDelay(99, { wsl: true });
+  assert.ok(DEFAULT_GRACE_MS >= 2 * ceiling, `grace ${DEFAULT_GRACE_MS} < 2 x backoff ceiling ${ceiling}`);
+  assert.ok(ceiling <= 20_000, "backoff ceiling stays below the old 60 s grace window");
+  // Cumulative wait before the 7th attempt (the one that used to land after 60 s) is well inside the grace.
+  let t = 0; for (let f = 0; f < 7; f++) t += reconnectDelay(f, { wsl: true });
+  assert.ok(t < DEFAULT_GRACE_MS, `7 attempts take ${t} ms`);
+});
+
+test("tracker (L5): a client that never sends a session_id keeps the 'default' session alive", () => {
+  const t = createSessionTracker({ send() {}, graceMs: 40 });
+  t.seen("1", undefined);
+  assert.deepEqual(t.alive(), ["default"]);
   t.stop();
 });
 

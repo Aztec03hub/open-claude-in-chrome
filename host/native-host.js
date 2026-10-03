@@ -16,7 +16,7 @@ import {
   clearStaleSocket,
   secureSocket
 } from "./endpoint.js";
-import { createSessionTracker } from "./session-tracker.js";
+import { createSessionTracker, DEFAULT_GRACE_MS } from "./session-tracker.js";
 import { nativeSizeError } from "./native-limit.js";
 
 // --- Native messaging protocol (Chrome <-> this process) ---
@@ -83,7 +83,7 @@ let clientIdCounter = 0;
 // session_end) and is told which are alive so quiet ones are never swept.
 const sessionTracker = createSessionTracker({
   send: writeNativeMessage,
-  graceMs: Number(process.env.OCIC_SESSION_GRACE_MS) || 60_000
+  graceMs: Number(process.env.OCIC_SESSION_GRACE_MS) || DEFAULT_GRACE_MS
 });
 setInterval(() => {
   const ids = sessionTracker.alive();

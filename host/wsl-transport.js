@@ -66,7 +66,7 @@ export function windowsPipePath(env = process.env, config = configFile()) {
 // node.exe, so while Chrome is closed back off (base, 2x, 4x ... up to max)
 // instead of launching one per second per session forever. A request that is
 // waiting for the bridge gets the base delay: it is about to time out.
-export function reconnectDelay(failures, { wsl, hasPending = false, base = 1000, max = 30_000 } = {}) {
+export function reconnectDelay(failures, { wsl, hasPending = false, base = 1000, max = 20_000 } = {}) {
   if (!wsl || hasPending) return base;
   return Math.min(base * 2 ** Math.min(failures, 16), max);
 }

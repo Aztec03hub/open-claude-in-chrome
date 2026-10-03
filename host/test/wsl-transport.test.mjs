@@ -55,7 +55,7 @@ test("pipe name: matches endpoint.js win32 derivation; win user override", async
 
 test("reconnectDelay (L3): WSL backs off to a cap, resets, and never delays a waiting request", () => {
   const w = (failures, extra = {}) => reconnectDelay(failures, { wsl: true, ...extra });
-  assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 10].map((n) => w(n)), [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 10].map((n) => w(n)), [1000, 2000, 4000, 8000, 16000, 20000, 20000, 20000]);
   assert.equal(w(9, { hasPending: true }), 1000, "a caller is waiting: base delay");
   assert.equal(reconnectDelay(9, { wsl: false, base: 500 }), 500, "native: constant");
 });
