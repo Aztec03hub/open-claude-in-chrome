@@ -61,11 +61,14 @@ export function createDialogLog() {
 /** Handle one Page.javascriptDialogOpening event. sendCommand(method, params) -> Promise. */
 export async function handleDialogOpening(tabId, params, { sendCommand, log }) {
   const accept = shouldAccept(params && params.type);
-  log.record(tabId, describeDialog(params, accept));
+  const note = describeDialog(params, accept);
   try {
     await sendCommand("Page.handleJavaScriptDialog", { accept });
+    log.record(tabId, note);
   } catch {
-    // dialog already gone (page navigated / user answered it): nothing to do
+    // Dialog already gone (page navigated / user answered it / debugger detached):
+    // do not claim it was handled.
+    log.record(tabId, `${note.replace(/ was (accepted|dismissed) automatically$/, "")} could not be answered automatically (it may already be closed)`);
   }
   return accept;
 }

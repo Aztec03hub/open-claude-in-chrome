@@ -297,6 +297,7 @@ const sessionTabs = createSessions(chrome, {
   onGroupsGone: (ids) => ids.forEach((id) => dropGifGroup(id)),
   // Never leave a CDP debugger (and its infobar) on a tab we stop managing.
   onRelease: async (tabId) => {
+    dialogLog.clearPending(tabId); // L3: the debugger goes, so its dialog events stop
     if (attachedTabs.has(tabId)) {
       try { await chrome.debugger.detach({ tabId }); } catch {}
       attachedTabs.delete(tabId);
@@ -495,6 +496,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // Handle user dismissing debugger bar
 chrome.debugger.onDetach.addListener((source, reason) => {
   attachedTabs.delete(source.tabId);
+  // L3: javascript_dialogClosed never arrives once the debugger is gone.
+  dialogLog.clearPending(source.tabId);
 });
 
 // --- CDP event listeners for console and network ---

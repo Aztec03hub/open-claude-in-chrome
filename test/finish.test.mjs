@@ -113,7 +113,8 @@ ok(sent[1][1].accept === true, "alert accepted");
 await handleDialogOpening(7, { type: "confirm", message: "x" }, { sendCommand: async () => { throw new Error("gone"); }, log });
 ok(log.drain(8).length === 0, "other tabs unaffected");
 const notes = log.drain(7);
-ok(notes.length === 3 && notes[0] === 'beforeunload "Leave?" on http://x/ was dismissed automatically', "notes recorded even if the CDP call fails");
+ok(notes.length === 3 && notes[0] === 'beforeunload "Leave?" on http://x/ was dismissed automatically', "notes recorded for every dialog");
+ok(/confirm "x" could not be answered automatically/.test(notes[2]) && !/dismissed automatically/.test(notes[2]), "L3: a failed CDP answer is reported as NOT answered, never as handled");
 ok(log.drain(7).length === 0, "drain clears");
 const res = withDialogNotes({ content: [{ type: "text", text: "ok" }] }, ["a", "b"]);
 ok(res.content.length === 2 && res.content[1].text === "[JS dialog handled: a; b]", "note appended to result");
@@ -301,6 +302,20 @@ console.log("== L1/L2 (review 00eac49): dispatcher and batch begin only owned ta
     { handlers: { computer: async () => t("ok"), tabs_attach_mcp: async () => t("ok") }, sessionId: "s", assertTabOwned: owns, selfChecked: new Set(["tabs_attach_mcp"]), inFlight });
   ok(begun.join() === "1", `L1: browser_batch begins only tabs the session owns (began: ${begun.join() || "none"}); foreign and self-checked tabs are not touched`);
   ok(r.isError === true && /not in this session/.test(txt({ content: r.content.slice(-1) })), "the foreign-tab action still fails on its ownership check");
+}
+
+console.log("== L3 (review 00eac49): a pending dialog is cleared when the debugger detaches ==");
+{
+  const bg = fs.readFileSync(path.join(ROOT, "extension", "background.js"), "utf8");
+  ok(/debugger\.onDetach\.addListener\(\(source, reason\) => \{[^}]*dialogLog\.clearPending\(source\.tabId\)/.test(bg), "onDetach clears the pending dialog");
+  ok(/onRelease: async \(tabId\) => \{\s*dialogLog\.clearPending\(tabId\)/.test(bg), "session onRelease clears the pending dialog");
+  const dl = createDialogLog(); const cmds = [];
+  dl.setPending(5, { type: "alert", message: "m" });
+  dl.clearPending(5); // what onDetach now does
+  ok((await answerPendingDialog(5, { sendCommand: async (m) => cmds.push(m), log: dl })) === false && cmds.length === 0 && dl.drain(5).length === 0, "after the clear nothing is answered and no phantom note is produced later");
+  const dl2 = createDialogLog();
+  await handleDialogOpening(5, { type: "alert", message: "gone" }, { sendCommand: async () => { throw new Error("detached"); }, log: dl2 });
+  ok(!/was accepted automatically/.test(dl2.drain(5).join()), "a dialog whose answer failed is not reported as accepted");
 }
 
 console.log("== cross-domain navigation ==");
