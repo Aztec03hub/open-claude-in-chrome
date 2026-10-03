@@ -25,6 +25,9 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
   const sessions = new Map();
   const locks = new Map();
   let loaded = null;
+  // Set by browserRestarted() (chrome.runtime.onStartup): the persisted tab ids
+  // belong to a previous browser run and mean nothing now.
+  let restartPending = false;
 
   // Mutating operations on one session run one at a time, so two concurrent
   // tabs_create_mcp calls cannot both decide "no group yet" and make two.
@@ -83,6 +86,17 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
     return live;
   }
 
+  // Tab ids restart on every browser launch, so after a restart a persisted
+  // created/attached/restore set cannot be matched against live ids (a stale
+  // "created" id could equal a user tab's new id and get it closed). Whatever is
+  // in the session's restored groups is adopted as ATTACHED: ungroup-only, never
+  // closed. Restore info (old group ids, pins) is dropped with the ids.
+  function adoptAsAttached(s, live) {
+    s.created = new Set();
+    s.attached = new Set(live.flatMap((g) => g.tabs.map((t) => t.id)));
+    s.restore = new Map();
+  }
+
   // Startup / service-worker-restart recovery: reload the persisted map, then
   // reconcile it against the live browser.
   function load() {
@@ -100,15 +114,36 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
         }
         for (const [sid, s] of [...sessions]) {
           const live = await liveGroups(sid);
-          const ids = new Set(live.flatMap((g) => g.tabs.map((t) => t.id)));
-          s.created = new Set([...s.created].filter((t) => ids.has(t)));
-          s.attached = new Set([...s.attached].filter((t) => ids.has(t)));
-          for (const k of [...s.restore.keys()]) if (!s.attached.has(k)) s.restore.delete(k);
+          if (restartPending) adoptAsAttached(s, live);
+          else {
+            const ids = new Set(live.flatMap((g) => g.tabs.map((t) => t.id)));
+            s.created = new Set([...s.created].filter((t) => ids.has(t)));
+            s.attached = new Set([...s.attached].filter((t) => ids.has(t)));
+            for (const k of [...s.restore.keys()]) if (!s.attached.has(k)) s.restore.delete(k);
+          }
           if (!live.length) sessions.delete(sid);
         }
         await persist();
       })();
     }
+    return loaded;
+  }
+
+  // chrome.runtime.onStartup: a NEW browser run (not an extension reload or a
+  // worker restart, which keep tab ids). Set the flag before load() reconciles;
+  // if load() already ran, redo the reconcile with the flag.
+  // ponytail: a tool call that slips in between load() and this redo could still
+  // see old ids; onStartup fires at worker start, before the host connects.
+  function browserRestarted() {
+    restartPending = true;
+    const redo = async () => {
+      for (const [sid, s] of [...sessions]) {
+        const live = await liveGroups(sid);
+        if (live.length) adoptAsAttached(s, live); else sessions.delete(sid);
+      }
+      await persist();
+    };
+    loaded = loaded ? loaded.then(redo) : load();
     return loaded;
   }
 
@@ -384,7 +419,7 @@ export function createSessions(chrome, { now = Date.now, onRelease = async () =>
   }
 
   return {
-    sessions, load, touch, noteAlive, ownedTabs, assertTabOwned, createTab, createdTab, context, attach, detach, close,
+    sessions, load, browserRestarted, touch, noteAlive, ownedTabs, assertTabOwned, createTab, createdTab, context, attach, detach, close,
     listAll, endSession, sweepIdle, onTabRemoved, isManaged, allManagedTabIds
   };
 }

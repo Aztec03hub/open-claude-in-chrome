@@ -1,4 +1,5 @@
 // Session tab model (extension/sessions.js) against a fake chrome.* object.
+import fs from "node:fs";
 import { createSessions, sidOf } from "../extension/sessions.js";
 let fail = 0; const ok = (c, m) => { console.log((c ? "  PASS " : "  FAIL ") + m); if (!c) fail++; };
 const rejects = async (p) => { try { await p; return null; } catch (e) { return e.message; } };
@@ -274,6 +275,47 @@ console.log("== an extension reload does not orphan a session (live 2026-10-02) 
   const fresh = await S2.createTab("new");
   ok(st.groups[fresh.groupId].title === "Claude", "a new session reuses the freed index, so no two live groups share a title");
 }
+
+console.log("== M3 (review 00eac49): a browser restart renumbers tabs; saved ids must never close anything ==");
+for (const early of [true, false]) {
+  // Run 1: session "old" created tab C (id 500+) and attached the user's tab 1.
+  const { chrome, st, S } = mk([{ id: 1, windowId: 7 }]);
+  const c = await S.createTab("old");
+  await S.attach("old", { tabId: 1 });
+  const gid = c.groupId;
+  // Browser restart: Chrome restores the group but numbers tabs again from 1. The tab that is
+  // now id C.tab.id is a USER tab that merely sits in the restored group; the old created tab got id 3.
+  st.tabs = [{ id: c.tab.id, windowId: 7, groupId: gid, active: false, title: "user tab" }, { id: 3, windowId: 7, groupId: gid, active: false }];
+  st.sessionStore = {};
+  const S2 = createSessions(chrome); // fresh worker after the restart
+  if (early) await S2.browserRestarted(); // onStartup fired before any tool call
+  else { await S2.load(); await S2.browserRestarted(); } // load() had already run when it fired
+  const r = await S2.endSession("old"); // 30-min sweep / late session_end
+  ok(r.closed.length === 0 && !st.calls.some((x) => x.n === "tabs.remove"), `${early ? "onStartup first" : "after load"}: nothing is closed (old created id ${c.tab.id} now names a user tab)`);
+  ok(r.ungrouped.sort().join() === [3, c.tab.id].sort().join() && st.tabs.every((t) => t.groupId === -1), `${early ? "onStartup first" : "after load"}: restored group tabs are ungrouped and left open`);
+}
+{
+  const { chrome, st, S } = mk([{ id: 1, windowId: 7, pinned: true }]);
+  await S.attach("old", { tabId: 1 });
+  st.tabs[0].groupId = st.tabs[0].groupId; // group survives restart
+  const S2 = createSessions(chrome);
+  await S2.browserRestarted();
+  ok(S2.sessions.get("old").restore.size === 0 && S2.sessions.get("old").created.size === 0, "restore info (old group ids / pins) and created ids are dropped");
+  const saved = st.store.ocic_sessions_v1.old;
+  ok(saved.created.length === 0 && saved.attached.join() === "1", "and the cleaned map is persisted");
+  const S3 = createSessions(chrome); // later worker restart, same run: normal reconcile keeps it
+  ok((await S3.ownedTabs("old")).length === 1 && S3.sessions.get("old").attached.has(1), "a later worker restart keeps the adopted tabs");
+}
+{
+  const { chrome, st, S } = mk();
+  await S.createTab("gone");
+  st.tabs = []; // the group did not come back at all
+  const S2 = createSessions(chrome);
+  await S2.browserRestarted();
+  ok(!S2.sessions.has("gone"), "a session whose group was not restored is forgotten");
+}
+const bgSrc = fs.readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
+ok(/chrome\.runtime\.onStartup\.addListener\([\s\S]{0,60}sessionTabs\.browserRestarted\(\)/.test(bgSrc), "background.js wires chrome.runtime.onStartup to browserRestarted");
 
 console.log("== M7: persist() failures are logged, not swallowed ==");
 {

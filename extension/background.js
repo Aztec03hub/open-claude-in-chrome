@@ -304,6 +304,8 @@ const sessionTabs = createSessions(chrome, {
   }
 });
 const assertTabOwned = (sessionId, tabId) => sessionTabs.assertTabOwned(sidOf(sessionId), tabId);
+// A new browser run renumbers every tab: the saved created/attached ids are void.
+chrome.runtime.onStartup.addListener(() => { sessionTabs.browserRestarted().catch(() => {}); });
 
 function formatTabContext(tabs, tabGroupId = null) {
   const available = tabs.map((t) => ({
