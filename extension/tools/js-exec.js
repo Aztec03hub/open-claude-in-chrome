@@ -60,7 +60,26 @@ export function formatEvalResult(res, timeoutMs = DEFAULT_TIMEOUT_MS) {
  */
 export async function runJavascript({ code, timeoutMs, evaluate }) {
   const t = clampTimeout(timeoutMs);
-  let res = await evaluate(wrapRepl(code), true, t);
-  if (isIllegalReturn(res.exceptionDetails)) res = await evaluate(wrapIife(code), false, t);
+  // Runtime.evaluate's `timeout` only bounds synchronous execution: time spent
+  // awaiting a promise does not count (live 2026-10-02: timeout:2 waited out a
+  // 5 s await). So the whole call also races a wall-clock deadline. A pending
+  // promise left behind is harmless; a busy loop is still killed by CDP's timeout.
+  const deadline = Date.now() + t;
+  const timedOut = { text: `Error: Execution timeout: Code exceeded ${t / 1000}-second limit`, isError: true };
+  const within = async (p) => {
+    let timer;
+    const left = Math.max(0, deadline - Date.now());
+    try {
+      return await Promise.race([p, new Promise((r) => { timer = setTimeout(() => r(null), left); })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  let res = await within(evaluate(wrapRepl(code), true, t));
+  if (res === null) return timedOut;
+  if (isIllegalReturn(res.exceptionDetails)) {
+    res = await within(evaluate(wrapIife(code), false, Math.max(100, deadline - Date.now())));
+    if (res === null) return timedOut;
+  }
   return formatEvalResult(res, t);
 }

@@ -77,6 +77,24 @@ ok(calls[calls.length - 1] === 5000, "timeout is configurable");
 ok(clampTimeout(999999) === 55000 && clampTimeout(-1) === 30000 && clampTimeout("x") === 30000 && clampTimeout(10) === 100, "timeout clamped");
 r = await runJavascript({ code: "while(1);", timeoutMs: 1000, evaluate: async () => ({ exceptionDetails: { exception: { description: "Error: Execution was terminated" } } }) });
 ok(r.isError && /Execution timeout: Code exceeded 1-second limit/.test(r.text), "terminated script reports a timeout");
+{
+  // CDP's timeout does not cover awaiting a promise (live 2026-10-02: timeout 2 s
+  // waited out a 5 s await), so an evaluate that never settles must still time out.
+  const t0 = Date.now();
+  r = await runJavascript({ code: "await new Promise(r => setTimeout(r, 5000))", timeoutMs: 300, evaluate: () => new Promise(() => {}) });
+  const took = Date.now() - t0;
+  ok(r.isError && /Execution timeout: Code exceeded 0.3-second limit/.test(r.text) && took >= 250 && took < 2000, `a hung await is cut off at the wall-clock timeout (${took} ms)`);
+  // The `return` retry shares the same deadline instead of getting a fresh one.
+  const t1 = Date.now();
+  let n = 0;
+  r = await runJavascript({
+    code: "return await never()", timeoutMs: 300,
+    evaluate: () => (n++ === 0
+      ? new Promise((res) => setTimeout(() => res({ exceptionDetails: { exception: { className: "SyntaxError", description: "SyntaxError: Illegal return statement" } } }), 200))
+      : new Promise(() => {}))
+  });
+  ok(r.isError && Date.now() - t1 < 600, `the return-retry uses what is left of the deadline (${Date.now() - t1} ms)`);
+}
 r = await runJavascript({ code: "x", evaluate: async () => ({ exceptionDetails: { exception: { className: "ReferenceError", description: "ReferenceError: x is not defined" } } }) });
 ok(r.isError && /ReferenceError: x is not defined/.test(r.text), "runtime errors surfaced, no retry on non-return errors");
 ok(formatEvalResult({ result: { type: "undefined" } }).text === "undefined", "undefined");
