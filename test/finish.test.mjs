@@ -271,6 +271,38 @@ console.log("== M1 (review 00eac49): dynamic error results keep isError, so brow
   ok(b.isError === true && clicked === false && /1 completed|0 completed/.test(txt({ content: b.content.slice(-1) })), "a batch stops after a failing javascript_tool and never reaches the click");
 }
 
+console.log("== L1/L2 (review 00eac49): dispatcher and batch begin only owned tabs; the mark is always released ==");
+{
+  const mkDispatch = ({ argSummary = () => "", handler = async () => t("ok"), selfChecked = new Set(["tabs_attach_mcp"]) } = {}) => {
+    const inf = createInFlight({ graceMs: 0 });
+    const begun = []; const rawBegin = inf.begin.bind(inf); inf.begin = (x) => (begun.push(x), rawBegin(x));
+    const sent = [];
+    const run = compile(extractFunction("handleToolRequest"),
+      { recorder: { deliveredIds: new Set() }, toolHandlers: { computer: handler, tabs_attach_mcp: handler }, sendResponse: (id, r) => sent.push(["ok", r]), sendError: (id, m) => sent.push(["err", m]),
+        sidOf: (x) => x, sessionTabs: { touch() {} }, SELF_CHECKED_TOOLS: selfChecked, assertTabOwned: async () => {}, indicator: { touch() {} }, inFlight: inf,
+        dbg() {}, argSummary, audit: { isEnabled: () => false }, resultShape: () => "", recordTiming() {}, finishResult: (r) => r, nativePort: null },
+      "handleToolRequest");
+    return { run, inf, begun, sent };
+  };
+  const a = mkDispatch();
+  await a.run("1", "tabs_attach_mcp", { tabId: 9 }, "s");
+  ok(a.begun.length === 0, "L1: a self-checked tool (tabs_attach_mcp {tabId}) does not begin/answer dialogs on a tab it does not own yet");
+  await a.run("2", "computer", { tabId: 9 }, "s");
+  ok(a.begun.join() === "9" && !a.inf.active(9), "an ordinary tool begins its tab and releases it");
+  const b = mkDispatch({ argSummary: () => { throw new Error("argSummary exploded"); } });
+  await b.run("3", "computer", { tabId: 4 }, "s");
+  ok(b.sent[0][0] === "err" && !b.inf.active(4), "L2: a throw between begin and the handler still releases the tab (counter not leaked) and is reported");
+
+  // browser_batch: tabs of other sessions are never begun
+  const begun = [];
+  const inFlight = { begin: (x) => (begun.push(x), undefined), end() {} };
+  const owns = async (sid, tab) => { if (tab !== 1) throw new Error("not in this session's tab group"); };
+  const r = await runBatch({ actions: [{ name: "computer", input: { tabId: 1 } }, { name: "computer", input: { tabId: 2 } }, { name: "tabs_attach_mcp", input: { tabId: 3 } }] },
+    { handlers: { computer: async () => t("ok"), tabs_attach_mcp: async () => t("ok") }, sessionId: "s", assertTabOwned: owns, selfChecked: new Set(["tabs_attach_mcp"]), inFlight });
+  ok(begun.join() === "1", `L1: browser_batch begins only tabs the session owns (began: ${begun.join() || "none"}); foreign and self-checked tabs are not touched`);
+  ok(r.isError === true && /not in this session/.test(txt({ content: r.content.slice(-1) })), "the foreign-tab action still fails on its ownership check");
+}
+
 console.log("== cross-domain navigation ==");
 ok(isCrossDomain("https://a.com/x", "https://b.com/") && !isCrossDomain("https://a.com/x", "https://a.com/y"), "host compare");
 ok(!isCrossDomain("about:blank", "https://a.com/") && !isCrossDomain("", "https://a.com/"), "no clear from a blank/unknown start");

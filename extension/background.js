@@ -2750,12 +2750,17 @@ async function handleToolRequest(id, tool, args, sessionId) {
   // Not awaited: the injection cannot run while the tab is blocked in a modal
   // dialog, and the call (and the dialog handler behind it) must not wait for it.
   if (args && typeof args.tabId === "number" && !SELF_CHECKED_TOOLS.has(tool)) indicator.touch(args.tabId);
+  const t0 = Date.now();
+  // L1: self-checked tools (tabs_attach_mcp ...) have not proven ownership yet, so
+  // they must not answer another session's or the user's dialog.
+  const driving = !!(args && typeof args.tabId === "number" && !SELF_CHECKED_TOOLS.has(tool));
+  const label = tool === "computer" ? `computer.${args && args.action}` : tool;
+  // L2: the try below owns begin/end, so nothing between them can leak the mark.
+  try {
   // Awaited: a dialog the page opened before this call would block every CDP
   // command of it, so it is answered first (bounded, never throws).
-  if (args && typeof args.tabId === "number") await inFlight.begin(args.tabId);
+  if (driving) await inFlight.begin(args.tabId);
 
-  const t0 = Date.now();
-  const label = tool === "computer" ? `computer.${args && args.action}` : tool;
   dbg("tool", `${label} <- ${argSummary(args)}`, { tab: args && args.tabId });
 
   // Attribute this action to the Claude Code session that asked for it. The
@@ -2785,26 +2790,25 @@ async function handleToolRequest(id, tool, args, sessionId) {
       })
       .catch(() => {});
   }
-  try {
-    const t0 = Date.now();
+  const tHandler = Date.now();
     const result = await handler(args, sid);
     // Record the SHAPE of the reply, not the reply. Echoing the response text
     // here would make the stream a copy of what the caller already received,
     // which is worth nothing to them; what they cannot see is how long it took
     // and how much came back.
-    dbg("tool", `${label} -> ${resultShape(result)}`, { tab: args && args.tabId, ms: Date.now() - t0 });
+    dbg("tool", `${label} -> ${resultShape(result)}`, { tab: args && args.tabId, ms: Date.now() - tHandler });
     // Upstream's separate per-call timing buffer, kept so its debug_timings tool
     // still reports. javascript_tool records its own richer entry (preMs/evalMs);
     // debug_timings reading the buffer should not pollute it.
     if (tool !== "javascript_tool" && tool !== "debug_timings") {
-      recordTiming({ t: t0, tool, tab: args?.tabId, ms: Date.now() - t0 });
+      recordTiming({ t: tHandler, tool, tab: args?.tabId, ms: Date.now() - tHandler });
     }
     sendResponse(id, finishResult(result, args));
   } catch (err) {
     dbg("tool", `${label} -> THREW`, { tab: args && args.tabId, ms: Date.now() - t0, err: String(err.message).slice(0, 160) });
     sendError(id, `${tool} failed: ${err.message}`);
   } finally {
-    if (args && typeof args.tabId === "number") inFlight.end(args.tabId);
+    if (driving) inFlight.end(args.tabId);
   }
 }
 

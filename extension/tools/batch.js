@@ -55,7 +55,14 @@ export async function runBatch(args, { handlers, sessionId, assertTabOwned, self
   const bad = validateBatch(args, handlers);
   if (bad) return { content: [{ type: "text", text: `browser_batch: ${bad}` }], isError: true };
 
-  const tabIds = [...new Set(args.actions.map((a) => a.input.tabId).filter((t) => typeof t === "number"))];
+  // L1: only tabs the session owns are marked in flight; a tab it does not own
+  // would get its (possibly the user's) dialog answered before the action's own
+  // ownership check refuses it. Self-checked tools do their own check later.
+  const candidates = [...new Set(args.actions.filter((a) => !TABLESS.has(a.name) && !selfChecked.has(a.name)).map((a) => a.input.tabId).filter((t) => typeof t === "number"))];
+  const tabIds = [];
+  for (const t of candidates) {
+    try { await assertTabOwned(sessionId, t); tabIds.push(t); } catch {}
+  }
   const begun = tabIds.map((t) => inFlight && inFlight.begin(t));
   try {
     await Promise.all(begun);
