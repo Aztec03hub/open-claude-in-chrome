@@ -60,7 +60,7 @@ export async function runBatch(args, { handlers, sessionId, assertTabOwned, self
   // ownership check refuses it. Self-checked tools do their own check later.
   const candidates = [...new Set(args.actions.filter((a) => !TABLESS.has(a.name) && !selfChecked.has(a.name)).map((a) => a.input.tabId).filter((t) => typeof t === "number"))];
   const tabIds = [];
-  for (const t of candidates) {
+  for (const t of inFlight ? candidates : []) {
     try { await assertTabOwned(sessionId, t); tabIds.push(t); } catch {}
   }
   const begun = tabIds.map((t) => inFlight && inFlight.begin(t));
