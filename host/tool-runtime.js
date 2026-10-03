@@ -17,23 +17,41 @@
 // without going through a child mcp-server.js + stdio MCP roundtrip.
 
 import net from "node:net";
+import crypto from "node:crypto";
 
 import { getPipePath } from "./endpoint.js";
 import { noteActivity } from "./parent-watch.js";
+import { isWsl, windowsPipePath, connectViaWindowsNode, reconnectDelay } from "./wsl-transport.js";
+import { filesFromPaths } from "./file-upload.js";
+import { findWithModel } from "./find-model.js";
+import { saveGifBlocks, exportNames } from "./gif-save.js";
 
-const PIPE_PATH = getPipePath();
+// Under WSL the host's pipe is a Windows named pipe, reached through a Windows
+// node.exe relay child (wsl-transport.js).
+// A unix-path OCIC_PIPE is an explicit native override (test harnesses): no relay.
+const WSL = isWsl() && !(process.env.OCIC_PIPE && !process.env.OCIC_PIPE.startsWith("\\\\.\\pipe\\"));
+const PIPE_PATH = WSL ? windowsPipePath() : getPipePath();
+
+// One id per MCP server process. The extension scopes the tabs a session owns
+// by it; a session_end message releases them.
+export const SESSION_ID = process.env.OCIC_SESSION_ID || crypto.randomUUID();
 
 const REQUEST_TIMEOUT_MS = 60_000;
 // The host dies and respawns whenever Chrome recycles the service worker, and
 // background.js reconnects 250ms later. A call landing in that window should
 // wait for the bridge to come back rather than fail.
 const LINK_GRACE_MS = 5_000;
-const RECONNECT_MS = 500;
+const RECONNECT_MS = Number(process.env.OCIC_RECONNECT_MS) || (WSL ? 1000 : 500); // each WSL retry spawns node.exe
+const RECONNECT_MAX_MS = Number(process.env.OCIC_RECONNECT_MAX_MS) || 30_000;
+let reconnectFailures = 0;
+const nextReconnectMs = () =>
+  reconnectDelay(reconnectFailures++, { wsl: WSL, hasPending: pendingRequests.size > 0, base: RECONNECT_MS, max: RECONNECT_MAX_MS });
 
 let started = false;
 let socket = null;
 let readBuffer = Buffer.alloc(0);
 let reconnectTimer = null;
+let warnedNoRelay = false;
 let shuttingDown = false;
 let requestIdCounter = 0;
 
@@ -112,14 +130,23 @@ function connect() {
   if (shuttingDown) return;
   reconnectTimer = null;
 
-  const sock = net.createConnection(PIPE_PATH);
+  let sock;
+  try {
+    sock = WSL ? connectViaWindowsNode() : net.createConnection(PIPE_PATH);
+  } catch (err) {
+    if (!warnedNoRelay) process.stderr.write(`Cannot reach the Windows bridge: ${err.message}\n`);
+    warnedNoRelay = true;
+    if (!shuttingDown && !reconnectTimer) reconnectTimer = setTimeout(connect, nextReconnectMs());
+    return;
+  }
   socket = sock;
   readBuffer = Buffer.alloc(0);
   let established = false;
 
   sock.on("connect", () => {
     established = true;
-    sock.write(JSON.stringify({ type: "client_hello" }) + "\n");
+    reconnectFailures = 0;
+    sock.write(JSON.stringify({ type: "client_hello", session_id: SESSION_ID }) + "\n");
     process.stderr.write(`Joined the browser bridge at ${PIPE_PATH}\n`);
   });
 
@@ -149,7 +176,7 @@ function connect() {
     if (socket === sock) socket = null;
     failPending();
     if (!shuttingDown && !reconnectTimer) {
-      reconnectTimer = setTimeout(connect, RECONNECT_MS);
+      reconnectTimer = setTimeout(connect, nextReconnectMs());
     }
   });
 }
@@ -181,12 +208,19 @@ function sendToExtension(tool, args) {
     const entry = { resolve, reject, timer, sent: false };
     pendingRequests.set(id, entry);
 
-    const line = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
+    const line = JSON.stringify({ id, type: "tool_request", tool, args, session_id: SESSION_ID }) + "\n";
 
     if (linkIsUp()) {
       entry.sent = true;
       socket.write(line);
       return;
+    }
+
+    // Idle backoff may have parked the next attempt far away; a caller is
+    // waiting now, so try immediately.
+    if (reconnectTimer && !socket && !shuttingDown) {
+      clearTimeout(reconnectTimer);
+      connect();
     }
 
     waitForLink(LINK_GRACE_MS).then((ok) => {
@@ -260,13 +294,34 @@ function textResult(text) {
 export async function callTool(toolName, args) {
   noteActivity();
   try {
-    const coerced = coerceArgs(args ?? {});
-    const result = await sendToExtension(toolName, coerced);
+    let coerced = coerceArgs(args ?? {});
+    if (toolName === "file_upload") coerced = await filesFromPaths(coerced, { wsl: WSL });
+    // browser_batch carries nested tool inputs; coerce each the same way, and
+    // map nested file_upload paths to Windows paths like the top level.
+    if (toolName === "browser_batch" && Array.isArray(coerced.actions)) {
+      for (const a of coerced.actions) {
+        if (!a || typeof a.input !== "object") continue;
+        coerceArgs(a.input);
+        if (a.name === "file_upload") a.input = await filesFromPaths(a.input, { wsl: WSL });
+      }
+    }
+    // `find` is model-backed: the model call runs here (WSL side), not in the browser.
+    const result =
+      toolName === "find" && !process.env.OCIC_FIND_SUBSTRING
+        ? await findWithModel(coerced, sendToExtension)
+        : await sendToExtension(toolName, coerced);
     if (typeof result === "string") return textResult(result);
-    if (result && result.content) return result;
+    // Extension-side error results arrive already flagged (handleToolRequest).
+    // gif_creator export returns the GIF bytes; keep them as a file here.
+    // browser_batch can contain a gif_creator export; saveGifBlocks is a no-op without GIF blocks.
+    if (result && result.content) {
+      if (toolName !== "gif_creator" && toolName !== "browser_batch") return result;
+      // The requested export filenames, in the order the GIFs come back.
+      return saveGifBlocks(result, undefined, exportNames(toolName, coerced));
+    }
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
-    return textResult(`Error: ${err.message}`);
+    return { ...textResult(`Error: ${err.message}`), isError: true };
   }
 }
 
@@ -285,6 +340,12 @@ export function shutdown() {
     reject(new Error("Server shutting down"));
   }
   pendingRequests.clear();
-  if (socket && !socket.destroyed) socket.destroy();
+  if (socket && !socket.destroyed) {
+    // end(), not destroy(): destroy could drop the session_end still buffered.
+    if (linkIsUp()) {
+      socket.write(JSON.stringify({ type: "session_end", session_id: SESSION_ID }) + "\n");
+      socket.end();
+    } else socket.destroy();
+  }
   socket = null;
 }
