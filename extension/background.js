@@ -1405,50 +1405,61 @@ const toolHandlers = {
     }
     if (!(await isInGroup(tabId))) return err(`Tab ${tabId} is not in the MCP group.`);
 
-    if (url === "back") {
-      await chrome.tabs.goBack(tabId);
-    } else if (url === "forward") {
-      await chrome.tabs.goForward(tabId);
-    } else {
-      let targetUrl = url;
-      // Strip any malformed protocol prefix before normalizing
-      if (!targetUrl.match(/^https?:\/\//i) && !targetUrl.startsWith("about:") && !targetUrl.startsWith("chrome:") && !targetUrl.startsWith("brave:")) {
-        // Remove any partial/broken protocol prefix (e.g., "hps://", "http:/", "ht://")
-        targetUrl = targetUrl.replace(/^[a-z]{1,5}:\/+/i, "");
-        targetUrl = "https://" + targetUrl;
-      }
-      try {
-        new URL(targetUrl); // Validate URL before passing to Chrome
-      } catch {
-        return err(`Invalid URL: "${url}". Could not parse as a valid URL.`);
-      }
-      await chrome.tabs.update(tabId, { url: targetUrl });
-    }
+    // M2: the tab was resolved here, so the dispatcher could not mark it in flight.
+    // Without this a beforeunload dialog opened by the navigation is only recorded
+    // as pending and the navigation silently stalls. Notes are drained here too,
+    // since args.tabId is unset for finishResult.
+    const own = typeof args.tabId !== "number";
+    if (own) await inFlight.begin(tabId);
+    try {
 
-    // Wait for page load — short timeout to avoid service worker idle kill
-    // If the page takes longer, the caller can use screenshot/wait to check
-    await new Promise((resolve) => {
-      const listener = (updatedTabId, info) => {
-        if (updatedTabId === tabId && info.status === "complete") {
+      if (url === "back") {
+        await chrome.tabs.goBack(tabId);
+      } else if (url === "forward") {
+        await chrome.tabs.goForward(tabId);
+      } else {
+        let targetUrl = url;
+        // Strip any malformed protocol prefix before normalizing
+        if (!targetUrl.match(/^https?:\/\//i) && !targetUrl.startsWith("about:") && !targetUrl.startsWith("chrome:") && !targetUrl.startsWith("brave:")) {
+          // Remove any partial/broken protocol prefix (e.g., "hps://", "http:/", "ht://")
+          targetUrl = targetUrl.replace(/^[a-z]{1,5}:\/+/i, "");
+          targetUrl = "https://" + targetUrl;
+        }
+        try {
+          new URL(targetUrl); // Validate URL before passing to Chrome
+        } catch {
+          return err(`Invalid URL: "${url}". Could not parse as a valid URL.`);
+        }
+        await chrome.tabs.update(tabId, { url: targetUrl });
+      }
+
+      // Wait for page load — short timeout to avoid service worker idle kill
+      // If the page takes longer, the caller can use screenshot/wait to check
+      await new Promise((resolve) => {
+        const listener = (updatedTabId, info) => {
+          if (updatedTabId === tabId && info.status === "complete") {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+        // 10s max — enough for most pages, avoids service worker timeout
+        setTimeout(() => {
           chrome.tabs.onUpdated.removeListener(listener);
           resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-      // 10s max — enough for most pages, avoids service worker timeout
-      setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }, 10000);
-    });
+        }, 10000);
+      });
 
-    const tab = await chrome.tabs.get(tabId);
-    const tabs = await chrome.tabs.query({ groupId: tab.groupId });
-    const loading = tab.status !== "complete" ? " (still loading)" : "";
-    const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
-      tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
+      const tab = await chrome.tabs.get(tabId);
+      const tabs = await chrome.tabs.query({ groupId: tab.groupId });
+      const loading = tab.status !== "complete" ? " (still loading)" : "";
+      const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
+        tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
 
-    return { content: [{ type: "text", text }] };
+    return withDialogNotes({ content: [{ type: "text", text }] }, dialogLog.drain(tabId));
+    } finally {
+      if (own) inFlight.end(tabId);
+    }
   },
 
   async computer(args) {
@@ -1745,7 +1756,7 @@ const toolHandlers = {
       }
 
       case "scroll_to": {
-        if (!coordinate && !args.ref) return { content: [{ type: "text", text: "coordinate or ref is required for scroll_to" }] };
+        if (!coordinate && !args.ref) return err("coordinate or ref is required for scroll_to");
         if (args.ref) {
           const sr = await sendContentMessage(tabId, {
             type: "scrollToRef",
@@ -1845,7 +1856,8 @@ const toolHandlers = {
       },
     });
 
-    let tree = resp?.result || "Error: Could not generate accessibility tree";
+    if (!resp?.result) return err("Error: Could not generate accessibility tree");
+    let tree = resp.result;
     // Append viewport dimensions so Claude knows the coordinate space
     try {
       await ensureAttached(tabId);
@@ -1938,7 +1950,7 @@ const toolHandlers = {
       const tEval = Date.now();
       // Top-level await, `return`, a hard timeout and scrubbed output: see
       // tools/js-exec.js. args.timeout is in seconds.
-      const { text: out } = await runJavascript({
+      const { text: out, isError } = await runJavascript({
         code: text,
         timeoutMs: args.timeout ? Number(args.timeout) * 1000 : undefined,
         evaluate: (expression, replMode, timeout) =>
@@ -1956,7 +1968,7 @@ const toolHandlers = {
       recordTiming({ t: tIn, tool: "javascript_tool", tab: tabId,
                      preMs: tEval - tIn, evalMs: Date.now() - tEval,
                      bytes: (text || "").length });
-      return { content: [{ type: "text", text: out }] };
+      return isError ? err(out) : { content: [{ type: "text", text: out }] };
     } catch (e) {
       return err(`Error: ${e.message}`);
     }

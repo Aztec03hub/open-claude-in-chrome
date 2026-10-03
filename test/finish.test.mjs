@@ -8,7 +8,8 @@ import { createDialogLog, handleDialogOpening, maybeHandleDialog, answerPendingD
 import { failedRecord, formatNetworkLine, isCrossDomain } from "../extension/tools/network.js";
 import { dropFileInPage, mimeFromBase64 } from "../extension/tools/upload.js";
 import { createIndicator, paintIndicator, INDICATOR_ID } from "../extension/tools/indicator.js";
-import { looksLikeError } from "../extension/tools/batch.js";
+import { looksLikeError, runBatch } from "../extension/tools/batch.js";
+import { runJavascript } from "../extension/tools/js-exec.js";
 import { err } from "../extension/tools/result.js";
 import { extractFunction, extractMethod, compile, ROOT } from "./_extract.mjs";
 
@@ -236,6 +237,40 @@ console.log("== M3: handlers flag their own failures (isError), no text inferenc
   ok(bare.length === 0, `no failure-shaped result in background.js bypasses err() (${bare.length} found${bare[0] ? ": " + bare[0].slice(0, 90) : ""})`);
 }
 
+console.log("== M1 (review 00eac49): dynamic error results keep isError, so browser_batch stops ==");
+{
+  // Behavioural: drives the SHIPPED handlers; fails if any of them drops isError.
+  const mkJs = (evaluateResult) => compile(
+    `const h = { ${extractMethod("javascript_tool")} };`,
+    { err, isInGroup: async () => true, ensureAttached: async () => {}, runJavascript, recordTiming() {}, withTimeout: (p) => p,
+      chrome: { debugger: { sendCommand: async () => evaluateResult } } }, "h").javascript_tool;
+  const thrown = await mkJs({ exceptionDetails: { exception: { description: "TypeError: Cannot set properties of null" } } })({ tabId: 1, text: "x" });
+  ok(thrown.isError === true && /^Error: TypeError/.test(txt(thrown)), "javascript_tool exception is isError");
+  const timedOut = await mkJs({ exceptionDetails: { exception: { description: "Error: Execution was terminated" } } })({ tabId: 1, text: "while(1);" });
+  ok(timedOut.isError === true && /Execution timeout/.test(txt(timedOut)), "javascript_tool timeout is isError");
+  const good = await mkJs({ result: { type: "number", value: 3 } })({ tabId: 1, text: "1+2" });
+  ok(good.isError === undefined && txt(good) === "3", "javascript_tool success is not flagged");
+
+  const readPage = (resp) => compile(
+    `const h = { ${extractMethod("read_page")} };`,
+    { err, isInGroup: async () => true, sendContentMessage: async () => resp, ensureAttached: async () => {}, cdp: async () => ({ result: { value: "800x600" } }) }, "h").read_page;
+  const rp = await readPage(undefined)({ tabId: 1 });
+  ok(rp.isError === true && /Could not generate accessibility tree/.test(txt(rp)), "read_page failure is isError");
+  ok((await readPage({ result: "tree" })({ tabId: 1 })).isError === undefined, "read_page success is not flagged");
+
+  const computer = compile(
+    `const h = { ${extractMethod("computer")} };`,
+    { err, isInGroup: async () => true, parseModifierString: () => 0, dbg() {} }, "h").computer;
+  const st = await computer({ tabId: 1, action: "scroll_to" });
+  ok(st.isError === true && /coordinate or ref is required/.test(txt(st)), "scroll_to without coordinate/ref is isError");
+
+  let clicked = false;
+  const handlers = { javascript_tool: mkJs({ exceptionDetails: { exception: { description: "TypeError: x is null" } } }), computer: async () => { clicked = true; return t("clicked"); } };
+  const b = await runBatch({ actions: [{ name: "javascript_tool", input: { tabId: 1, text: "x.y=1" } }, { name: "computer", input: { tabId: 1, action: "left_click" } }] },
+    { handlers, sessionId: "s", assertTabOwned: async () => {} });
+  ok(b.isError === true && clicked === false && /1 completed|0 completed/.test(txt({ content: b.content.slice(-1) })), "a batch stops after a failing javascript_tool and never reaches the click");
+}
+
 console.log("== cross-domain navigation ==");
 ok(isCrossDomain("https://a.com/x", "https://b.com/") && !isCrossDomain("https://a.com/x", "https://a.com/y"), "host compare");
 ok(!isCrossDomain("about:blank", "https://a.com/") && !isCrossDomain("", "https://a.com/"), "no clear from a blank/unknown start");
@@ -279,10 +314,11 @@ console.log("== H3: a blocked tab (modal dialog / busy renderer) cannot hold the
 
 console.log("== navigate without tabId (shipped handler) ==");
 const navCalls = [];
-const mkNav = (tabs) => compile(
+// inFlight / dialogLog are the dispatcher's own; `onUpdate` lets a test act while tabs.update runs.
+const mkNav = (tabs, { inFlight = createInFlight(), dialogLog = createDialogLog(), onUpdate = async () => {} } = {}) => compile(
   `const h = { ${extractMethod("navigate")} };`,
-  { err, sessionTabs: { createdTab: async (sid) => (navCalls.push([sid]), tabs[0] || {}) }, isInGroup: async (t) => t === 7,
-    chrome: { tabs: { update: async () => {}, get: async () => ({ id: 7, url: "https://a.com/", status: "complete", groupId: 1 }), query: async () => [{ id: 7, url: "https://a.com/" }],
+  { err, inFlight, dialogLog, withDialogNotes, sessionTabs: { createdTab: async (sid) => (navCalls.push([sid]), tabs[0] || {}) }, isInGroup: async (t) => t === 7,
+    chrome: { tabs: { update: onUpdate, get: async () => ({ id: 7, url: "https://a.com/", status: "complete", groupId: 1 }), query: async () => [{ id: 7, url: "https://a.com/" }],
       onUpdated: { addListener: (f) => f(7, { status: "complete" }), removeListener() {} } } } },
   "h"
 ).navigate;
@@ -290,6 +326,41 @@ const navOk = await mkNav([{ id: 7 }])({ url: "a.com" }, "sess");
 ok(navCalls[0][0] === "sess", "L5: asks the session for a tab IT CREATED (never tabs[0] of everything it owns)");
 ok(/^Navigated to https:\/\/a\.com\//.test(txt(navOk)), "navigates that tab");
 ok(/^Error: no tab available/.test(txt(await mkNav([])({ url: "a.com" }, "sess"))) && (await mkNav([])({ url: "a.com" }, "sess")).isError === true, "clear error (isError) when the session has no tab");
+
+console.log("== M2 (review 00eac49): navigate without tabId marks the tab it resolves as in flight ==");
+{
+  const inFlight = createInFlight();
+  const dialogLog = createDialogLog();
+  const cmds = [];
+  const sendCommand = async (m, p) => cmds.push([m, p]);
+  // The page already has an open beforeunload (user typed in a form, > 2 s ago): recorded as pending.
+  dialogLog.setPending(7, { type: "beforeunload", message: "Leave?" });
+  let during = null;
+  const nav = mkNav([{ id: 7 }], {
+    inFlight: { ...inFlight, begin: (t) => inFlight.begin(t) },
+    dialogLog,
+    onUpdate: async () => {
+      during = inFlight.active(7);
+      // the navigation itself opens a beforeunload dialog while chrome.tabs.update runs
+      await maybeHandleDialog(7, { type: "beforeunload", message: "Leave 2?" }, { inFlight, sendCommand, log: dialogLog });
+    },
+  });
+  const r = await nav({ url: "b.com" }, "sess");
+  ok(during === true, "the resolved tab is in flight while the navigation runs");
+  ok(cmds.length === 1 && cmds[0][1].accept === false, "a dialog opened by the navigation is dismissed (not left pending)");
+  ok(/beforeunload "Leave 2\?"/.test(r.content.at(-1).text) && /JS dialog handled/.test(r.content.at(-1).text), "its note is on the navigate result (args.tabId was unset for finishResult)");
+  // after the call: counter released (grace window aside)
+  const inf2 = createInFlight({ now: () => 1e9 });
+  const nav2 = mkNav([{ id: 7 }], { inFlight: inf2 });
+  await nav2({ url: "b.com" }, "sess");
+  inf2.forget(7);
+  ok(!inf2.active(7), "navigate releases its in-flight mark (no leaked counter)");
+  // tabId given: the dispatcher owns the mark; navigate must not double-count
+  const inf3 = createInFlight();
+  let n3 = 0; const b3 = inf3.begin.bind(inf3); inf3.begin = (t) => (n3++, b3(t));
+  await mkNav([{ id: 7 }], { inFlight: inf3 })({ url: "b.com", tabId: 7 }, "sess");
+  ok(n3 === 0, "with an explicit tabId navigate leaves begin/end to the dispatcher");
+}
 
 console.log(fail ? `\n${fail} FAILED` : "\nall passed");
 process.exit(fail ? 1 : 0);
