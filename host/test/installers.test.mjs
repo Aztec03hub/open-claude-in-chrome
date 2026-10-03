@@ -41,6 +41,17 @@ test("install updates extension/ and host/ in place and never deletes them (live
   }
 });
 
+test("L7 (review 00eac49): install-wsl.sh checks for rsync up front and says how to get it, before writing anything", () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "occ-nobin-"));
+  fs.symlinkSync(spawnSync("which", ["dirname"], { encoding: "utf-8" }).stdout.trim(), path.join(bin, "dirname"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "occ-norsync-"));
+  const dest = path.join(home, "dest");
+  const r = spawnSync("/bin/bash", [path.join(ROOT, "install-wsl.sh")], { env: { PATH: bin, HOME: home, USER: "x", OCIC_WIN_DIR: dest }, encoding: "utf-8" });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /rsync is required \(sudo apt install rsync\)/);
+  assert.ok(!fs.existsSync(dest), "nothing was created before the check");
+});
+
 test("M5: the config.json writer keeps other keys and sets winUser", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "occ-cfg-"));
   const cfg = path.join(home, ".config", "open-claude-in-chrome", "config.json");

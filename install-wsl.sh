@@ -47,6 +47,7 @@ find_win_node() {
   [ -n "$f" ] && echo "$f"
 }
 
+command -v rsync >/dev/null || { echo "rsync is required (sudo apt install rsync)" >&2; exit 1; }
 [ -d "/mnt/c/Users/$WIN_USER" ] || { echo "No /mnt/c/Users/$WIN_USER (set OCIC_WIN_USER)"; exit 1; }
 WIN_NODE="$(find_win_node)" || true
 [ -n "$WIN_NODE" ] || { echo "No Windows node.exe found (set OCIC_WIN_NODE)"; exit 1; }
