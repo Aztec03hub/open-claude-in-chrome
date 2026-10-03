@@ -78,7 +78,11 @@ export async function runJavascript({ code, timeoutMs, evaluate }) {
   let res = await within(evaluate(wrapRepl(code), true, t));
   if (res === null) return timedOut;
   if (isIllegalReturn(res.exceptionDetails)) {
-    res = await within(evaluate(wrapIife(code), false, Math.max(100, deadline - Date.now())));
+    // Never start the user's code again once the deadline has passed: it would
+    // run with side effects after the timeout had already been reported.
+    const left = deadline - Date.now();
+    if (left <= 0) return timedOut;
+    res = await within(evaluate(wrapIife(code), false, left));
     if (res === null) return timedOut;
   }
   return formatEvalResult(res, t);

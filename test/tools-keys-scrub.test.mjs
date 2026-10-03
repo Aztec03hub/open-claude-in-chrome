@@ -90,10 +90,12 @@ ok(r.isError && /Execution timeout: Code exceeded 1-second limit/.test(r.text), 
   r = await runJavascript({
     code: "return await never()", timeoutMs: 300,
     evaluate: () => (n++ === 0
-      ? new Promise((res) => setTimeout(() => res({ exceptionDetails: { exception: { className: "SyntaxError", description: "SyntaxError: Illegal return statement" } } }), 200))
+      ? new Promise((res) => setTimeout(() => res({ exceptionDetails: { exception: { className: "SyntaxError", description: "SyntaxError: Illegal return statement" } } }), 250))
       : new Promise(() => {}))
   });
-  ok(r.isError && Date.now() - t1 < 600, `the return-retry uses what is left of the deadline (${Date.now() - t1} ms)`);
+  const took1 = Date.now() - t1;
+  // Shared deadline: ~300 ms. A fresh deadline for the retry: ~250 + 300 = 550 ms.
+  ok(r.isError && /Execution timeout/.test(r.text) && n === 2 && took1 < 450, `the return-retry uses what is left of the deadline (${took1} ms)`);
 }
 r = await runJavascript({ code: "x", evaluate: async () => ({ exceptionDetails: { exception: { className: "ReferenceError", description: "ReferenceError: x is not defined" } } }) });
 ok(r.isError && /ReferenceError: x is not defined/.test(r.text), "runtime errors surfaced, no retry on non-return errors");
